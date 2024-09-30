@@ -30,5 +30,5 @@ def chunk_documents(documents) :
   doc_chunk_texts = [chunk.page_content for chunk in doc_chunks]
   df_chunks = pd.DataFrame(doc_chunk_texts)
   df_chunks.rename(columns = {0:'Chunks'}, inplace = True)
-  print(df_chunks.shape, df_chunks.head())
+  #print(df_chunks.shape, df_chunks.head())
   return df_chunks

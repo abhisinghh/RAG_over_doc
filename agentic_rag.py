@@ -4,19 +4,13 @@ from chunker import chunk_documents
 import yaml
 import os
 from openai import OpenAI
+import numpy as np
 
 
 with open('config.yaml', 'r') as file:
     config = yaml.safe_load(file)
 
 os.environ["OPENAI_API_KEY"] = config['openai_api_key']
-
-
-
-## LOADING THE PDF TO DOCUMENTS
-loader = PyPDFLoader("./content.pdf")
-documents = loader.load()
-
 
 
 vector_embedding_model = config["vector_embedding_model"]
@@ -31,11 +25,6 @@ def get_embedding(text, model=vector_embedding_model):
         print(f"Error generating embedding for text: {text[:50]}... - {e}")
         return None
 
-## chunking he documents
-df_chunks = chunk_documents(documents)
-
-print(df_chunks.shape)
-df_chunks['embedding'] = df['Chunks'].apply(get_embedding)
 
 
 ## threshold for embedding similarity
