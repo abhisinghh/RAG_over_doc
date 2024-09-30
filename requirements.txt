@@ -1,0 +1,9 @@
+pandas
+numpy
+langchain
+langchain-community
+langchain_experimental
+langchain_openai
+pypdf
+openai
+gradio
