@@ -54,6 +54,6 @@ def find_most_similar(query, df):
     sorted_df = filtered_df.sort_values(by='similarity', ascending=False)
     top_k_df = sorted_df.head(top_k)
 
-    return top_k_df[['chunks', 'similarity']]
+    return top_k_df[['Chunks', 'similarity']]
     
  
