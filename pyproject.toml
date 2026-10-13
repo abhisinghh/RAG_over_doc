@@ -1,11 +1,11 @@
 [project]
 name = "ragdoc"
-version = "0.2.0"
-description = "Agentic RAG over documents: contextual hybrid retrieval, reranking, self-correcting agent loop, citations and evaluation."
+version = "0.3.0"
+description = "Agentic multimodal RAG with GraphRAG: documents, tables, charts, images, audio, video, code repositories and microservices, with citations and evaluation."
 readme = "README.md"
 requires-python = ">=3.11"
 authors = [{ name = "Abhimanyu Singh" }]
-keywords = ["rag", "agentic-rag", "llm", "retrieval", "langgraph", "evaluation"]
+keywords = ["rag", "agentic-rag", "graphrag", "multimodal", "llm", "retrieval", "langgraph", "code-search", "evaluation"]
 classifiers = [
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.11",
@@ -26,6 +26,8 @@ dependencies = [
     "rank-bm25>=0.2.2",
     "pypdf>=4.2",
     "python-docx>=1.1",
+    "pillow>=10.0",
+    "networkx>=3.2",
     "typer>=0.12",
     "rich>=13.7",
 ]
@@ -39,11 +41,17 @@ cohere = ["cohere>=5.5"]
 api = ["fastapi>=0.111", "uvicorn[standard]>=0.30", "python-multipart>=0.0.9"]
 ui = ["gradio>=4.40"]
 mcp = ["mcp>=1.2"]
+# Local speech-to-text (OpenAI Whisper API needs no extra). Audio/video also need ffmpeg on PATH.
+media = ["faster-whisper>=1.0"]
+# Neo4j graph store for large knowledge/code/service graphs.
+neo4j = ["neo4j>=5.20"]
+# Server-side BM25 sparse vectors in Qdrant (retrieval.lexical: qdrant_sparse).
+scale = ["fastembed>=0.3"]
 tracing = [
     "opentelemetry-sdk>=1.25",
     "opentelemetry-exporter-otlp-proto-http>=1.25",
 ]
-all = ["ragdoc[docling,local,cohere,api,ui,mcp,tracing]"]
+all = ["ragdoc[docling,local,cohere,api,ui,mcp,tracing,media,neo4j,scale]"]
 dev = [
     "pytest>=8.2",
     "pytest-cov>=5.0",

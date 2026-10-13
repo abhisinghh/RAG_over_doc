@@ -1,13 +1,28 @@
-# ragdoc · Agentic RAG over documents
+# ragdoc · Agentic multimodal RAG with GraphRAG
 
 [![CI](https://github.com/abhisinghh/RAG_over_doc/actions/workflows/ci.yml/badge.svg)](https://github.com/abhisinghh/RAG_over_doc/actions/workflows/ci.yml)
 [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/abhisinghh/RAG_over_doc/blob/main/notebooks/demo.ipynb)
 
-Question answering over your PDFs, Word and Markdown files that **cites the page behind every
-claim, says "not in the document" instead of guessing, and shows its work**. It combines
-contextual hybrid retrieval with a bounded, self-correcting agent loop, and ships with an
-evaluation harness that compares the dense baseline, hybrid retrieval and the agentic loop on
+Question answering over **documents, tables, charts, images, audio, video, code repositories
+and microservice estates** that cites the exact source behind every claim (page, figure,
+`mm:ss`, `file:lines`), says "not in the document" instead of guessing, and shows its work.
+A router picks the right strategy per question: contextual hybrid search, GraphRAG
+local/global search, text-to-SQL over extracted tables, or code and service-dependency graphs,
+inside a bounded, self-correcting agent loop. An evaluation harness compares configurations on
 your own golden set.
+
+| Content | How it is understood | Cited as |
+| --- | --- | --- |
+| PDF, Word, Markdown | Docling layout parsing, sections, contextual chunks | page |
+| Tables | Kept whole, multi-page tables stitched, loaded into SQL for computed answers | page, SQL result |
+| Figures and charts | Vision model description + OCR; charts → data tables; optional CLIP image search | figure on page |
+| Audio | Whisper with segment timestamps, 90-second windows | `12:40-14:10` |
+| Video | Soundtrack transcript + keyframes described with transcript context | `frame at 03:30` |
+| Code | Symbol-level chunks (functions, class outlines), call graph | `file`, lines, symbol |
+| Microservices | Services, endpoints, calls, topics, datastores from compose/k8s/OpenAPI/proto/routes | service map + `file:line` evidence |
+
+See [docs/design/multimodal-graph-scale.md](docs/design/multimodal-graph-scale.md) for how each
+content type, GraphRAG and scale to millions of documents are handled.
 
 ## Highlights
 
@@ -19,7 +34,12 @@ your own golden set.
 | Summary tree | Optional RAPTOR-style summaries for whole-document questions | [RAPTOR](https://arxiv.org/abs/2401.18059) |
 | Hybrid search | BM25 + dense vectors fused with Reciprocal Rank Fusion | Cormack et al., 2009 |
 | Reranking | LLM listwise, local cross-encoder (bge-reranker) or Cohere | — |
-| Routing | Simple / multi-hop / out-of-scope, so easy questions stay cheap | [Adaptive-RAG](https://arxiv.org/abs/2403.14403) |
+| Routing | simple, multi-hop, global, relational, structured, code or out-of-scope; only routes the index can serve are offered | [Adaptive-RAG](https://arxiv.org/abs/2403.14403) |
+| GraphRAG | Entity/relation extraction, communities + reports, local and global graph search (SQLite or Neo4j) | [GraphRAG](https://arxiv.org/abs/2404.16130), [LightRAG](https://arxiv.org/abs/2410.05779) |
+| Tables → SQL | Read-only text-to-SQL over every extracted table and chart | — |
+| Multimodal | VLM figure/chart understanding, keyframes, CLIP image vectors, figures sent to vision generators | — |
+| Code & services | Symbol chunking, call graph, service dependency graph with impact analysis | — |
+| Scale | Server-side sparse+dense hybrid in Qdrant, int8 quantization, document routing, sharded resumable batch ingestion | — |
 | Planning | Multi-hop questions split into self-contained sub-questions | [IRCoT](https://arxiv.org/abs/2212.10509) |
 | Evidence grading | 0-3 relevance per passage; weak evidence triggers a rewrite + HyDE retry, then abstention | [CRAG](https://arxiv.org/abs/2401.15884), [HyDE](https://arxiv.org/abs/2212.10496) |
 | Cited generation | Every sentence cites `[n]` → file + page; invalid markers stripped | — |
@@ -36,6 +56,9 @@ flowchart TD
     R -- out of scope --> X[Polite refusal]
     R -- simple --> RET[Hybrid retrieve<br/>BM25 + dense, RRF]
     R -- multi-hop --> P[Plan sub-questions] --> RET
+    R -- global / relational --> GR[Graph search<br/>communities or entities] --> RET
+    R -- structured --> SQLN[Text-to-SQL<br/>over tables] --> RET
+    R -- code --> CG[Call graph +<br/>service graph] --> RET
     RET --> RR[Rerank top-k] --> G{Evidence<br/>relevant?}
     G -- no, rounds left --> RW[Rewrite query + HyDE] --> RET
     G -- no, budget spent --> AB[Abstain: not in document]
@@ -46,7 +69,7 @@ flowchart TD
 ```
 
 Ingestion is a one-off per document and idempotent by file hash:
-`parse → (redact) → chunk → contextualize → (summary tree) → embed → index`.
+`parse → figures (VLM) → tables (SQL) → (redact) → chunk → context → (summaries) → embed → index → (graph)`.
 
 Set `agent.enabled: false` and the same index answers in a single pass, which is the
 baseline the evaluation compares against.
@@ -78,6 +101,11 @@ route=simple · 4210 ms · 9120+412 tokens
 Other entry points:
 
 ```bash
+ragdoc ingest recordings/                                       # audio + video (needs ffmpeg)
+ragdoc ingest-repo ~/code/platform                              # code + microservice graph
+ragdoc services payments                                        # what calls it, what it calls, impact
+ragdoc graph build                                              # communities for "global" questions
+ragdoc ingest-batch /data/corpus --workers 16 --shard 0/4       # resumable, multi-machine
 ragdoc batch questions.txt -f report.pdf --output output.json   # the original notebook workflow
 ragdoc ui                                                       # Gradio app with live agent steps
 ragdoc serve                                                    # REST API on :8000
@@ -119,6 +147,10 @@ ragdoc ask "..."
 | Best reranking quality offline | `pip install ".[local]"`, `retrieval.reranker: cross_encoder` |
 | Production vector DB | `retrieval.qdrant_url: http://qdrant:6333` (see `docker/`) |
 | Tracing | `tracing.otlp_endpoint: http://localhost:6006/v1/traces` (Phoenix) |
+| GraphRAG | `graph.enabled: true`, then `ragdoc graph build`; `graph.store: neo4j` for large graphs |
+| Image search | `pip install ".[local]"`, `multimodal.image_embeddings: true` |
+| Local speech-to-text | `pip install ".[media]"`, `media.transcriber: local` |
+| Millions of documents | `pip install ".[scale]"`, `retrieval.lexical: qdrant_sparse`, `retrieval.quantization: int8`, `ingestion.doc_summary: true` + `retrieval.doc_routing: true` |
 
 Models are configurable per role: a small `fast_model` routes, grades, rewrites and
 contextualizes; the `strong_model` writes the answer.
@@ -148,14 +180,18 @@ multi-hop, summary and ~10-15% unanswerable questions.
 | Method | Path | Purpose |
 | --- | --- | --- |
 | GET | `/health` | Liveness and index stats |
-| GET / POST | `/documents` | List / upload and ingest (multipart) |
+| GET / POST | `/documents` | List (paginated) / upload and ingest any supported file |
 | DELETE | `/documents/{doc_id}` | Remove a document |
 | POST | `/search` | Hybrid search + rerank, no generation |
 | POST | `/ask` | Cited answer; `"debug": true` adds the trace |
 | POST | `/ask/stream` | Server-Sent Events: one `step` per agent node, then `result` |
+| GET | `/assets/{path}` | The figure or video frame behind a citation |
+| GET / POST | `/graph/stats`, `/graph/build` | Graph counts / rebuild communities |
+| GET | `/services/{name}` | Dependency facts for one microservice |
 
-`docker compose -f docker/docker-compose.yml up --build` starts the API, a Qdrant server and
-Arize Phoenix for traces (http://localhost:6006).
+`docker compose -f docker/docker-compose.yml up --build` starts the API (with ffmpeg), a Qdrant
+server with server-side hybrid search, Neo4j for the graph, and Arize Phoenix for traces
+(http://localhost:6006).
 
 ## Project layout
 
@@ -163,10 +199,12 @@ Arize Phoenix for traces (http://localhost:6006).
 src/ragdoc/
 ├── config.py            typed settings: YAML + env overrides, secrets from .env
 ├── engine.py            RagEngine facade used by every interface
-├── ingestion/           parsers, chunking, contextual retrieval, summary tree, pipeline
-├── models/              provider-agnostic LLM (structured output) and cached embeddings
-├── retrieval/           Qdrant / in-memory vectors, BM25, RRF, rerankers, query transforms
-├── agent/               LangGraph state, nodes and graph; tools for MCP
+├── ingestion/           parsers, figures, tables (SQL), media, chunking, context, pipeline, batch
+├── models/              LLM (structured + vision), embeddings, CLIP, transcription
+├── retrieval/           Qdrant (dense + sparse) / in-memory vectors, BM25, RRF, rerankers
+├── graph/               graph stores (SQLite, Neo4j), extraction, communities, graph search
+├── code/                code parsing, repository ingestion, call graph, service discovery
+├── agent/               LangGraph state, routes, strategies, nodes; tools for MCP
 ├── generation/          numbered sources in, [n] citations out
 ├── guardrails/          prompt-injection screen, PII redaction
 ├── observability/       per-step trace + OpenTelemetry export
@@ -192,9 +230,12 @@ make lint
 - [x] Contextual hybrid retrieval, reranking, citations, evaluation harness
 - [x] Agentic loop: routing, planning, grading, rewrite + HyDE, verification, abstention
 - [x] API with streaming, Gradio UI, MCP server, caching, guardrails, Docker, tracing
-- [ ] GraphRAG / LightRAG mode for global and multi-hop questions
-- [ ] Multimodal: figure captions, ColPali page-image retrieval
-- [ ] pgvector backend
+- [x] GraphRAG: entities, communities, local and global search (SQLite or Neo4j)
+- [x] Multimodal: figures, charts → tables, images, audio, video keyframes
+- [x] Code repositories and microservice dependency graphs
+- [x] Scale: server-side hybrid search, quantization, document routing, sharded batch ingestion
+- [ ] ColPali page-image retrieval for slide decks and scans; speaker diarisation
+- [ ] Postgres chunk store and pgvector backend for multi-replica deployments
 - [ ] Published benchmark results for dense vs graph vs agentic
 
 ## References
@@ -205,5 +246,7 @@ make lint
 - Jeong et al., [Adaptive-RAG](https://arxiv.org/abs/2403.14403), 2024 · Yan et al., [Corrective RAG](https://arxiv.org/abs/2401.15884), 2024 · Asai et al., [Self-RAG](https://arxiv.org/abs/2310.11511), 2023
 - Gao et al., [HyDE](https://arxiv.org/abs/2212.10496), 2022 · Dhuliawala et al., [Chain-of-Verification](https://arxiv.org/abs/2309.11495), 2023
 - Sarthi et al., [RAPTOR](https://arxiv.org/abs/2401.18059), 2024 · Liu et al., [Lost in the Middle](https://arxiv.org/abs/2307.03172), 2023
+- Edge et al., [From Local to Global: GraphRAG](https://arxiv.org/abs/2404.16130), 2024 · Guo et al., [LightRAG](https://arxiv.org/abs/2410.05779), 2024
+- Faysse et al., [ColPali](https://arxiv.org/abs/2407.01449), 2024
 - Es et al., [RAGAS](https://arxiv.org/abs/2309.15217), 2023
 - Mendelevitch & Bao, [Hands-On RAG for Production](https://www.oreilly.com/library/view/hands-on-rag-for/9798341621701/), O'Reilly 2026 ([code](https://github.com/ofermend/hands-on-rag))

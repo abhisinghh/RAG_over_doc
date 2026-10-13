@@ -8,7 +8,18 @@ from pydantic import BaseModel, Field
 
 from ragdoc.types import Citation, ScoredChunk
 
-RouteName = Literal["simple", "multi_hop", "out_of_scope"]
+RouteName = Literal[
+    "simple", "multi_hop", "global", "relational", "structured", "code", "out_of_scope"
+]
+ROUTE_DESCRIPTIONS: dict[str, str] = {
+    "simple": "answerable from one passage or lookup (a definition, a figure, a single fact)",
+    "multi_hop": "needs several facts combined, a comparison or a multi-part answer",
+    "global": "asks about themes, trends or a summary across the whole collection",
+    "relational": "asks how named entities (people, organisations, products, systems) relate or connect",
+    "structured": "needs numbers computed from tables or charts (totals, averages, rankings, growth)",
+    "code": "about source code, APIs, services, their dependencies or architecture",
+    "out_of_scope": "greetings, chit-chat, or requests unrelated to the indexed content",
+}
 
 
 class AgentState(TypedDict, total=False):
@@ -33,7 +44,7 @@ class AgentState(TypedDict, total=False):
 
 
 class RouteDecision(BaseModel):
-    route: RouteName
+    route: str
     reason: str = ""
 
 

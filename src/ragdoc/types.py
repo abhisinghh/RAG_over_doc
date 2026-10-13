@@ -1,4 +1,9 @@
-"""Core data types shared across the pipeline."""
+"""Core data types shared across the pipeline.
+
+Every piece of content, whatever its source, becomes a ``Chunk`` with a ``modality`` and a
+*locator* (page, figure, timestamp range or file:line range), so retrieval, citation,
+grading and evaluation work the same way for PDFs, slides, audio, video and code.
+"""
 
 from __future__ import annotations
 
@@ -6,17 +11,34 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
-BlockKind = Literal["text", "heading", "table", "list", "caption"]
-ChunkKind = Literal["chunk", "summary"]
+BlockKind = Literal["text", "heading", "table", "list", "caption", "figure", "segment", "symbol"]
+Modality = Literal["text", "table", "image", "chart", "audio", "video", "code", "service"]
+DocKind = Literal["document", "image", "audio", "video", "code", "service"]
+# Structural role of an indexed unit (modality says what it *is*, kind says what it is *for*).
+ChunkKind = Literal["chunk", "summary", "doc_summary", "community", "entity"]
+
+
+def format_timestamp(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
 
 
 class Block(BaseModel):
-    """A structural unit produced by a parser (paragraph, heading, table...)."""
+    """A structural unit produced by a parser (paragraph, table, figure, transcript segment...)."""
 
     text: str
     page: int | None = None
     kind: BlockKind = "text"
+    modality: Modality = "text"
     heading_path: list[str] = Field(default_factory=list)
+    asset: str | None = None  # relative path of an extracted image / keyframe
+    start_s: float | None = None  # audio / video time range
+    end_s: float | None = None
+    line_start: int | None = None  # code line range (1-based, inclusive)
+    line_end: int | None = None
+    meta: dict[str, Any] = Field(default_factory=dict)
 
 
 class ParsedDocument(BaseModel):
@@ -26,6 +48,9 @@ class ParsedDocument(BaseModel):
     blocks: list[Block]
     num_pages: int | None = None
     sha256: str
+    kind: DocKind = "document"
+    duration_s: float | None = None
+    meta: dict[str, Any] = Field(default_factory=dict)
 
     @property
     def full_text(self) -> str:
@@ -41,8 +66,14 @@ class Chunk(BaseModel):
     pages: list[int] = Field(default_factory=list)
     heading_path: list[str] = Field(default_factory=list)
     kind: ChunkKind = "chunk"
-    level: int = 0  # 0 = leaf chunk, >0 = RAPTOR summary level
+    modality: Modality = "text"
+    level: int = 0  # 0 = leaf, >0 = summary / community level
     position: int = 0
+    asset: str | None = None
+    start_s: float | None = None
+    end_s: float | None = None
+    line_start: int | None = None
+    line_end: int | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
 
     @property
@@ -63,6 +94,25 @@ class Chunk(BaseModel):
         lo, hi = min(self.pages), max(self.pages)
         return f"p. {lo}" if lo == hi else f"pp. {lo}-{hi}"
 
+    @property
+    def locator(self) -> str:
+        """Human-readable position used in citations."""
+        if self.line_start is not None:
+            end = f"-{self.line_end}" if self.line_end and self.line_end != self.line_start else ""
+            symbol = self.metadata.get("symbol")
+            return f"lines {self.line_start}{end}" + (f" ({symbol})" if symbol else "")
+        if self.start_s is not None:
+            span = format_timestamp(self.start_s)
+            if self.end_s is not None and self.end_s > self.start_s:
+                span += f"-{format_timestamp(self.end_s)}"
+            return ("frame at " if self.modality in ("image", "chart") else "") + span
+        if self.modality in ("image", "chart"):
+            label = "chart" if self.modality == "chart" else "figure"
+            return f"{label}, {self.page_label}" if self.pages else label
+        if self.kind == "community":
+            return "community report"
+        return self.page_label
+
 
 class ScoredChunk(BaseModel):
     chunk: Chunk
@@ -78,6 +128,9 @@ class Citation(BaseModel):
     source: str
     pages: list[int]
     snippet: str
+    modality: Modality = "text"
+    locator: str = ""
+    asset: str | None = None
 
 
 class TraceEvent(BaseModel):

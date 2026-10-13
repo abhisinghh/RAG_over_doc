@@ -48,23 +48,133 @@ def main(
 @app.command()
 def ingest(
     ctx: typer.Context,
-    path: Annotated[Path, typer.Argument(exists=True, help="A file or a folder of documents")],
+    path: Annotated[
+        Path, typer.Argument(exists=True, help="A file or folder: documents, images, audio, video")
+    ],
     force: Annotated[bool, typer.Option(help="Re-index even if unchanged")] = False,
 ) -> None:
-    """Parse, chunk, contextualize, embed and index documents."""
+    """Index documents and media (PDF, Word, Markdown, images, audio, video)."""
     engine = _engine(ctx)
     with console.status("Ingesting..."):
         reports = engine.ingest_path(path, force=force)
-    table = Table("doc_id", "source", "pages", "chunks", "summaries", "status")
+    table = Table("doc_id", "source", "kind", "chunks", "figures", "tables", "entities", "status")
     for r in reports:
         table.add_row(
             r.doc_id,
             r.source,
-            str(r.num_pages or "-"),
+            r.kind,
             str(r.num_chunks),
-            str(r.num_summaries),
+            str(r.figures),
+            str(r.tables),
+            str(r.entities),
             "unchanged" if r.skipped else f"indexed in {r.seconds}s",
         )
+    console.print(table)
+
+
+@app.command("ingest-repo")
+def ingest_repo(
+    ctx: typer.Context,
+    path: Annotated[Path, typer.Argument(exists=True, file_okay=False, help="Repository root")],
+    name: Annotated[str | None, typer.Option(help="Repository name (default: folder name)")] = None,
+    force: bool = False,
+) -> None:
+    """Index a code repository or microservice monorepo: code, configs, docs, call graph and
+    service dependency graph."""
+    engine = _engine(ctx)
+    from rich.progress import Progress
+
+    with Progress(console=console) as progress:
+        task = progress.add_task("Indexing repository", total=None)
+
+        def on_progress(info: dict[str, object]) -> None:
+            progress.update(task, total=info["total"], completed=info["done"])
+
+        report = engine.ingest_repo(path, name, force=force, on_progress=on_progress)
+    console.print(
+        f"[bold]{report.repo}[/bold]: {report.files} files ({report.indexed} indexed, "
+        f"{report.skipped} unchanged, {len(report.failed)} failed) · {report.symbols} symbols · "
+        f"{report.services} services · {report.service_edges} dependencies · {report.topics} topics"
+    )
+    for rel, err in report.failed[:10]:
+        console.print(f"  [red]failed[/red] {rel}: {err}")
+
+
+@app.command("ingest-batch")
+def ingest_batch(
+    ctx: typer.Context,
+    path: Annotated[Path | None, typer.Argument(help="Folder to index recursively")] = None,
+    manifest: Annotated[Path | None, typer.Option(help="Text file with one path per line")] = None,
+    workers: Annotated[int | None, typer.Option(help="Parallel documents")] = None,
+    shard: Annotated[
+        str | None, typer.Option(help="i/n: only this shard of the paths (multi-machine)")
+    ] = None,
+) -> None:
+    """Resumable, parallel ingestion for large corpora (re-run to resume / retry failures)."""
+    engine = _engine(ctx)
+    if manifest:
+        paths = [
+            Path(p.strip()) for p in manifest.read_text(encoding="utf-8").splitlines() if p.strip()
+        ]
+    elif path:
+        paths = engine.discover_files(path)
+    else:
+        raise typer.BadParameter("Give a folder or --manifest")
+    shard_spec = None
+    if shard:
+        i, n = (int(x) for x in shard.split("/"))
+        shard_spec = (i, n)
+    from rich.progress import Progress
+
+    with Progress(console=console) as progress:
+        task = progress.add_task("Ingesting", total=None)
+
+        def on_progress(info: dict[str, object]) -> None:
+            progress.update(task, total=info["total"], completed=info["done"])
+
+        summary = engine.ingest_batch(
+            paths, workers=workers, shard=shard_spec, on_progress=on_progress
+        )
+    console.print(summary)
+
+
+graph_app = typer.Typer(help="Knowledge graph commands.", no_args_is_help=True)
+app.add_typer(graph_app, name="graph")
+
+
+@graph_app.command("build")
+def graph_build(ctx: typer.Context) -> None:
+    """Detect communities and write community reports (enables global questions)."""
+    engine = _engine(ctx)
+    with console.status("Building communities and reports..."):
+        stats = engine.build_graph_index()
+    console.print_json(json.dumps(stats, default=str))
+
+
+@graph_app.command("stats")
+def graph_stats(ctx: typer.Context) -> None:
+    """Node, edge and community counts."""
+    console.print_json(json.dumps(_engine(ctx).graph.stats(), default=str))
+
+
+@app.command()
+def services(
+    ctx: typer.Context,
+    name: Annotated[str | None, typer.Argument(help="Show one service's dependencies")] = None,
+) -> None:
+    """List discovered microservices, or the dependency facts for one service."""
+    engine = _engine(ctx)
+    if name:
+        facts = engine.graph_retriever.services(name)
+        console.print(facts[0].chunk.text if facts else "No such service found.")
+        return
+    nodes = engine.graph.all_nodes(["service"])
+    edges = engine.graph.all_edges(["CALLS"])
+    table = Table("service", "calls", "called by", "root")
+    for n in sorted(nodes, key=lambda n: n.name):
+        out = sorted({e.target.split(":", 1)[-1] for e in edges if e.source == n.id})
+        inc = sorted({e.source.split(":", 1)[-1] for e in edges if e.target == n.id})
+        table.add_row(n.name, ", ".join(out[:8]), ", ".join(inc[:8]), str(n.data.get("root", "")))
     console.print(table)
 
 
@@ -73,8 +183,8 @@ def _print_answer(result: Any, show_trace: bool) -> None:
     if result.citations:
         console.print("\n[bold]Sources[/bold]")
         for c in result.citations:
-            pages = ", ".join(map(str, c.pages)) or "n/a"
-            console.print(f"  [{c.marker}] {c.source}, page(s) {pages}: [dim]{c.snippet}[/dim]")
+            where = c.locator or (", ".join(map(str, c.pages)) or "n/a")
+            console.print(f"  [{c.marker}] {c.source}, {where}: [dim]{c.snippet[:200]}[/dim]")
     if result.verification and result.verification.get("passed") is False:
         console.print(
             "[yellow]Warning: some statements could not be verified against the sources.[/yellow]"

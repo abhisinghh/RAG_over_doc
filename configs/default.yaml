@@ -11,6 +11,7 @@ llm:
   # Models per role: small/cheap for routing and grading, strong for answering.
   fast_model: gpt-5-mini
   strong_model: gpt-5
+  vision_model: null          # null = strong_model; must accept image input
   temperature: null           # null = provider default (reasoning models reject custom values)
   max_output_tokens: 2048
   request_timeout_s: 60
@@ -33,6 +34,8 @@ ingestion:
   raptor: false               # build a summary tree for whole-document questions
   raptor_group_size: 6
   redact_pii: false
+  doc_summary: false          # one summary vector per document (required for retrieval.doc_routing)
+  workers: 8                  # parallel LLM calls per document / documents per batch
 
 retrieval:
   vector_store: qdrant        # qdrant | memory (numpy, for tests and tiny corpora)
@@ -46,9 +49,17 @@ retrieval:
   cross_encoder_model: BAAI/bge-reranker-v2-m3
   cohere_model: rerank-v3.5
   final_k: 8                  # chunks that reach the generator
+  # --- scale (millions of chunks) ---
+  lexical: memory             # memory (in-process BM25, <~100k chunks) | qdrant_sparse (server-side BM25 + RRF)
+  quantization: none          # none | int8 (4x less RAM for vectors, tiny recall cost)
+  on_disk: false              # keep vectors on disk (Qdrant mmap)
+  doc_routing: false          # 2-stage: pick top documents by summary, then search their chunks
+  doc_routing_top_docs: 50
 
 agent:
   enabled: true               # false = plain single-pass hybrid RAG (the baseline)
+  # Routes the router may choose; drop ones you don't need (e.g. no graph → remove relational/global).
+  routes: [simple, multi_hop, global, relational, structured, code]
   max_rewrites: 2             # rewrite-and-retry rounds before abstaining
   max_sub_questions: 4
   min_relevant_chunks: 1      # chunks graded >= relevance_threshold needed to proceed
@@ -64,3 +75,49 @@ cache:
 tracing:
   otlp_endpoint: null         # e.g. http://localhost:3000/api/public/otel (Langfuse) or Phoenix's /v1/traces
   service_name: ragdoc
+
+multimodal:
+  describe_images: true       # VLM description + OCR for figures and video keyframes
+  chart_to_table: true        # charts → approximate data table, queryable with SQL
+  min_image_px: 120           # skip icons and logos
+  max_images_per_doc: 200
+  image_embeddings: false     # CLIP vectors for text→image search (pip install ragdoc[local])
+  image_embedding_model: clip-ViT-B-32
+  answer_with_images: true    # send the top figures to the (vision) generator
+  max_answer_images: 3
+
+tables:
+  merge_multipage: true       # stitch tables split across page breaks
+  rows_per_chunk: 40          # large tables are chunked by row groups, header repeated
+  sql: true                   # load tables into SQLite for aggregate / numeric questions
+  max_sql_rows: 200
+
+media:
+  transcriber: openai         # openai (whisper-1, timestamped segments) | local (faster-whisper)
+  transcription_model: whisper-1
+  local_whisper_model: small
+  language: null
+  window_seconds: 90          # transcript chunk length
+  keyframe_interval_s: 30     # video frames sampled for VLM captions
+  keyframe_scene_threshold: null   # e.g. 0.3 to sample on scene changes instead
+  max_keyframes: 120
+
+code:
+  max_file_bytes: 1000000
+  symbol_max_lines: 150       # longer functions/classes are split into overlapping windows
+  window_overlap_lines: 15
+  services: true              # detect microservices and build the service dependency graph
+  summarize_services: true
+
+graph:
+  enabled: false              # GraphRAG: one extraction call per chunk at ingestion
+  store: sqlite               # sqlite (local) | neo4j (scale; set neo4j_uri + NEO4J_PASSWORD)
+  neo4j_uri: null
+  neo4j_user: neo4j
+  entity_types: [person, organization, location, product, technology, concept, event, metric, document]
+  local_top_entities: 10
+  max_hops: 1
+  max_relations: 40
+  community_max_size: 40
+  community_min_size: 3
+  global_top_communities: 12
