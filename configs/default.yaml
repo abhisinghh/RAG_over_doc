@@ -1,0 +1,66 @@
+# ragdoc default configuration. Secrets never go here: put API keys in .env.
+# Any value can be overridden with an env var: RAGDOC__<SECTION>__<KEY>, e.g.
+#   RAGDOC__RETRIEVAL__RERANKER=none
+
+index_dir: .ragdoc            # where the index, caches and manifests live
+collection: default           # one collection per corpus
+
+llm:
+  provider: openai            # openai | anthropic | openai_compatible (Ollama, vLLM, LM Studio...)
+  base_url: null              # only for openai_compatible, e.g. http://localhost:11434/v1
+  # Models per role: small/cheap for routing and grading, strong for answering.
+  fast_model: gpt-5-mini
+  strong_model: gpt-5
+  temperature: null           # null = provider default (reasoning models reject custom values)
+  max_output_tokens: 2048
+  request_timeout_s: 60
+  max_retries: 3
+
+embeddings:
+  provider: openai            # openai | openai_compatible | local (sentence-transformers)
+  model: text-embedding-3-small
+  base_url: null
+  batch_size: 128
+  dimensions: null            # optional truncation for text-embedding-3-* models
+
+ingestion:
+  parser: auto                # auto (docling if installed, else pypdf) | docling | pypdf
+  chunk_tokens: 600
+  chunk_overlap_tokens: 80
+  min_chunk_tokens: 40
+  contextualize: true         # Anthropic-style contextual retrieval headers (one LLM call per chunk)
+  context_max_doc_tokens: 60000   # document text passed to the contextualizer is truncated to this
+  raptor: false               # build a summary tree for whole-document questions
+  raptor_group_size: 6
+  redact_pii: false
+
+retrieval:
+  vector_store: qdrant        # qdrant | memory (numpy, for tests and tiny corpora)
+  qdrant_url: null            # null = embedded local Qdrant in index_dir; or http://localhost:6333
+  mode: hybrid                # dense | bm25 | hybrid
+  dense_k: 60
+  bm25_k: 60
+  rrf_k: 60
+  fused_k: 40                 # candidates passed to the reranker
+  reranker: llm               # none | llm | cross_encoder | cohere
+  cross_encoder_model: BAAI/bge-reranker-v2-m3
+  cohere_model: rerank-v3.5
+  final_k: 8                  # chunks that reach the generator
+
+agent:
+  enabled: true               # false = plain single-pass hybrid RAG (the baseline)
+  max_rewrites: 2             # rewrite-and-retry rounds before abstaining
+  max_sub_questions: 4
+  min_relevant_chunks: 1      # chunks graded >= relevance_threshold needed to proceed
+  relevance_threshold: 2      # UMBRELA-style 0-3 scale
+  verify_answers: true
+  max_revisions: 1
+  use_hyde: true
+
+cache:
+  answers: true
+  embeddings: true
+
+tracing:
+  otlp_endpoint: null         # e.g. http://localhost:3000/api/public/otel (Langfuse) or Phoenix's /v1/traces
+  service_name: ragdoc
