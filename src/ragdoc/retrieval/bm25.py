@@ -11,6 +11,7 @@ from collections.abc import Sequence
 
 from rank_bm25 import BM25Okapi
 
+from ragdoc.retrieval.store import SearchFilter
 from ragdoc.types import Chunk
 
 _TOKEN_RE = re.compile(r"[a-z0-9]+(?:[._-][a-z0-9]+)*")
@@ -114,6 +115,8 @@ class BM25Index:
     def __init__(self, chunks: Sequence[Chunk]) -> None:
         self._ids = [c.chunk_id for c in chunks]
         self._docs = [c.doc_id for c in chunks]
+        self._kinds = [c.kind for c in chunks]
+        self._modalities = [c.modality for c in chunks]
         corpus = [tokenize(c.index_text) for c in chunks]
         self._bm25 = BM25Okapi(corpus) if corpus and any(corpus) else None
 
@@ -121,20 +124,22 @@ class BM25Index:
         return len(self._ids)
 
     def search(
-        self, query: str, k: int, doc_ids: Sequence[str] | None = None
+        self, query: str, k: int, flt: SearchFilter | Sequence[str] | None = None
     ) -> list[tuple[str, float]]:
         if self._bm25 is None:
             return []
         tokens = tokenize(query)
         if not tokens:
             return []
+        if flt is not None and not isinstance(flt, SearchFilter):
+            flt = SearchFilter.build(doc_ids=list(flt))  # backwards compatible: doc id list
         scores = self._bm25.get_scores(tokens)
-        allowed = set(doc_ids) if doc_ids else None
         ranked = sorted(
             (
                 (self._ids[i], float(s))
                 for i, s in enumerate(scores)
-                if s > 0 and (allowed is None or self._docs[i] in allowed)
+                if s > 0
+                and (flt is None or flt.accepts(self._docs[i], self._kinds[i], self._modalities[i]))
             ),
             key=lambda pair: -pair[1],
         )

@@ -9,8 +9,12 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
+# ffmpeg: audio/video ingestion (transcription pieces, keyframes)
+RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
+
 # EXTRAS=all adds Docling (layout-aware PDF parsing) and local models; much larger image.
-ARG EXTRAS=api,ui,mcp,tracing
+ARG EXTRAS=api,ui,mcp,tracing,scale,neo4j
 
 COPY pyproject.toml README.md ./
 COPY src ./src

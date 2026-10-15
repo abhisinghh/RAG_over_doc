@@ -1,16 +1,19 @@
 """Agent nodes. Each node takes the state and returns a partial state update.
 
-Techniques: Adaptive-RAG routing, query decomposition, CRAG-style evidence grading with
-query rewriting + HyDE, cited generation, and Chain-of-Verification style claim checking.
+Techniques: Adaptive-RAG routing over retrieval strategies (hybrid search, HippoRAG 2
+Personalized PageRank, GraphRAG local/global search, text-to-SQL over tables, code and
+service graphs), query decomposition, CRAG-style evidence grading with query rewriting and
+HyDE, cited multimodal generation, and Chain-of-Verification style claim checking.
 """
 
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from ragdoc.agent.state import AgentState, Grades, RouteDecision, Verification
+from ragdoc.agent.state import ROUTE_DESCRIPTIONS, AgentState, Grades, RouteDecision, Verification
 from ragdoc.config import Settings
 from ragdoc.generation.citations import (
     ABSTAIN_TEXT,
@@ -20,17 +23,28 @@ from ragdoc.generation.citations import (
     strip_invalid_markers,
 )
 from ragdoc.guardrails import neutralise
-from ragdoc.models.llm import LLM, Message, structured
+from ragdoc.models.llm import LLM, ImageInput, Message, guess_mime, structured
 from ragdoc.observability.tracing import TraceRecorder
 from ragdoc.prompts import render
 from ragdoc.retrieval.query_transform import decompose, rewrite_query
 from ragdoc.retrieval.retriever import HybridRetriever
 from ragdoc.types import ScoredChunk
 
+if TYPE_CHECKING:
+    from ragdoc.graph.hipporag import HippoRetriever
+    from ragdoc.graph.search import GraphRetriever
+    from ragdoc.ingestion.assets import AssetStore
+    from ragdoc.ingestion.tables import TableStore
+
 log = logging.getLogger(__name__)
 
 OUT_OF_SCOPE_TEXT = (
     "I can only answer questions about the indexed documents. Ask me something about their content."
+)
+PINNED_SOURCES = ("graph_", "sql")  # computed evidence that bypasses the relevance grader
+_SERVICE_HINT = re.compile(
+    r"\b(service|microservice|endpoint|api|depend|call|topic|queue|kafka|grpc|deploy|outage|down)\w*",
+    re.IGNORECASE,
 )
 
 
@@ -41,6 +55,12 @@ class AgentDeps:
     retriever: HybridRetriever
     recorder: TraceRecorder
     documents: list[str] = field(default_factory=list)  # titles, for the router prompt
+    graph: GraphRetriever | None = None
+    ppr: HippoRetriever | None = None  # HippoRAG 2 Personalized PageRank retrieval
+    has_entities: bool = False  # the knowledge graph contains extracted entities
+    tables: TableStore | None = None
+    assets: AssetStore | None = None
+    available_routes: list[str] = field(default_factory=lambda: ["simple", "multi_hop"])
 
 
 def _merge_evidence(*groups: list[ScoredChunk], limit: int) -> list[ScoredChunk]:
@@ -58,21 +78,31 @@ def _merge_evidence(*groups: list[ScoredChunk], limit: int) -> list[ScoredChunk]
     return [best[cid] for cid in order][:limit]
 
 
+def _pinned(item: ScoredChunk) -> bool:
+    return item.source.startswith(PINNED_SOURCES)
+
+
 # --------------------------------------------------------------------------- nodes
 
 
 def route(state: AgentState, deps: AgentDeps) -> dict[str, Any]:
+    allowed = [r for r in deps.available_routes if r in ROUTE_DESCRIPTIONS] + ["out_of_scope"]
+    routes_text = "\n".join(f'- "{r}": {ROUTE_DESCRIPTIONS[r]}' for r in allowed)
     with deps.recorder.span("route") as d:
         try:
             decision = structured(
                 deps.llm,
-                system=render("route", documents=", ".join(deps.documents) or "uploaded documents"),
+                system=render(
+                    "route",
+                    documents=", ".join(deps.documents) or "uploaded documents",
+                    routes=routes_text,
+                ),
                 user=state["question"],
                 schema=RouteDecision,
                 role="fast",
                 task="route",
             )
-            route_name = decision.route
+            route_name = decision.route if decision.route in allowed else "simple"
             d["reason"] = decision.reason
         except Exception as exc:  # never block a question on a routing failure
             log.warning("Routing failed (%s); defaulting to simple", exc)
@@ -95,6 +125,57 @@ def plan(state: AgentState, deps: AgentDeps) -> dict[str, Any]:
     return {"sub_questions": subs}
 
 
+def _strategy_evidence(
+    state: AgentState, deps: AgentDeps, detail: dict[str, Any]
+) -> list[ScoredChunk]:
+    """Route-specific evidence gathered on the first round (graph facts, SQL results...)."""
+    question = state["question"]
+    doc_ids = state.get("doc_ids")
+    route_name = state.get("route", "simple")
+    out: list[ScoredChunk] = []
+    try:
+        if route_name == "global" and deps.graph is not None:
+            out = deps.graph.global_(question)
+        elif (
+            route_name in ("relational", "multi_hop")
+            and deps.ppr is not None
+            and (
+                "relational" in deps.available_routes  # the graph has extracted entities
+            )
+        ):
+            # HippoRAG 2: PageRank from recognised facts; empty when no fact is relevant.
+            out = deps.ppr.search(question, doc_ids)
+            detail["graph_mode"] = "ppr"
+            if not out and route_name == "relational" and deps.graph is not None:
+                out = deps.graph.local(question, doc_ids)
+                detail["graph_mode"] = "local (no relevant facts)"
+        elif route_name == "relational" and deps.graph is not None:
+            out = deps.graph.local(question, doc_ids)
+            detail["graph_mode"] = "local"
+        elif route_name == "code" and deps.graph is not None:
+            out = deps.graph.code(question, doc_ids)
+            if _SERVICE_HINT.search(question):
+                out += deps.graph.services(question)
+        elif route_name == "structured" and deps.tables is not None:
+            from ragdoc.ingestion.tables import answer_with_sql, candidate_tables
+
+            table_hits = deps.retriever.search(
+                question, doc_ids=doc_ids, modalities=["table", "chart"], top_k=6
+            )
+            tables = candidate_tables(deps.tables, question, table_hits, doc_ids)
+            sql = answer_with_sql(
+                deps.llm, deps.tables, question, tables, deps.settings.tables.max_sql_rows
+            )
+            out = ([sql] if sql else []) + table_hits
+            detail["sql"] = sql.chunk.metadata.get("sql") if sql else None
+    except Exception as exc:  # a failing strategy degrades to plain hybrid retrieval
+        log.warning("Strategy %s failed: %s", route_name, exc)
+        detail["strategy_error"] = str(exc)
+    detail["strategy"] = route_name
+    detail["strategy_hits"] = len(out)
+    return out
+
+
 def retrieve(state: AgentState, deps: AgentDeps) -> dict[str, Any]:
     cfg = deps.settings.retrieval
     first_round = not state.get("queries_tried")
@@ -103,32 +184,45 @@ def retrieve(state: AgentState, deps: AgentDeps) -> dict[str, Any]:
     else:
         queries = [state.get("current_query") or state["question"]]
     hyde = state.get("hyde_text") if not first_round else None
+    route_name = state.get("route", "simple")
+    modalities = ["code", "service", "text"] if route_name == "code" else None
 
     with deps.recorder.span("retrieve", queries=queries, hyde=bool(hyde)) as d:
+        strategy = _strategy_evidence(state, deps, d) if first_round else []
         per_query = max(3, cfg.final_k // max(1, len(queries))) if len(queries) > 1 else cfg.final_k
         groups = [
-            deps.retriever.search(q, dense_text=hyde, doc_ids=state.get("doc_ids"), top_k=per_query)
+            deps.retriever.search(
+                q,
+                dense_text=hyde,
+                doc_ids=state.get("doc_ids"),
+                top_k=per_query,
+                modalities=modalities,
+            )
             for q in queries
         ]
-        # Keep evidence already graded relevant from earlier rounds.
+        # Keep evidence already graded relevant (or pinned) from earlier rounds.
         threshold = deps.settings.agent.relevance_threshold
-        previous = [e for e in state.get("evidence", []) if (e.relevance or 0) >= threshold]
+        previous = [
+            e for e in state.get("evidence", []) if _pinned(e) or (e.relevance or 0) >= threshold
+        ]
         limit = cfg.final_k if len(queries) == 1 else min(cfg.final_k * 2, 16)
-        evidence = _merge_evidence(previous, *groups, limit=limit)
+        evidence = _merge_evidence(strategy, previous, *groups, limit=limit + len(strategy))
         d["retrieved"] = [e.chunk.chunk_id for e in evidence]
     return {"evidence": evidence, "queries_tried": [*state.get("queries_tried", []), *queries]}
 
 
 def grade(state: AgentState, deps: AgentDeps) -> dict[str, Any]:
     evidence = state.get("evidence", [])
+    pinned = [e.model_copy(update={"relevance": e.relevance or 3}) for e in evidence if _pinned(e)]
+    to_grade = [e for e in evidence if not _pinned(e)]
     agent_cfg = deps.settings.agent
-    with deps.recorder.span("grade", candidates=len(evidence)) as d:
-        if not evidence:
-            d["relevant"] = 0
-            return {"evidence": []}
+    with deps.recorder.span("grade", candidates=len(to_grade), pinned=len(pinned)) as d:
+        if not to_grade:
+            d["relevant"] = len(pinned)
+            return {"evidence": pinned}
         passages = "\n\n".join(
             f'<passage id="{i}">\n{neutralise(e.chunk.index_text[:1200])}\n</passage>'
-            for i, e in enumerate(evidence)
+            for i, e in enumerate(to_grade)
         )
         question = state["question"]
         if state.get("sub_questions"):
@@ -145,16 +239,16 @@ def grade(state: AgentState, deps: AgentDeps) -> dict[str, Any]:
             scores = {g.id: g.score for g in grades.grades}
         except Exception as exc:  # fail open: let the generator and verifier decide
             log.warning("Grading failed (%s); treating all passages as relevant", exc)
-            scores = {i: agent_cfg.relevance_threshold for i in range(len(evidence))}
+            scores = {i: agent_cfg.relevance_threshold for i in range(len(to_grade))}
 
         graded = [
-            e.model_copy(update={"relevance": scores.get(i, 0)}) for i, e in enumerate(evidence)
+            e.model_copy(update={"relevance": scores.get(i, 0)}) for i, e in enumerate(to_grade)
         ]
         relevant = [e for e in graded if (e.relevance or 0) >= agent_cfg.relevance_threshold]
         relevant.sort(key=lambda e: (-(e.relevance or 0), -e.score))
-        d["relevant"] = len(relevant)
+        d["relevant"] = len(relevant) + len(pinned)
         d["scores"] = {e.chunk.chunk_id: e.relevance for e in graded}
-    return {"evidence": relevant}
+    return {"evidence": pinned + relevant}
 
 
 def decide_after_grade(state: AgentState, deps: AgentDeps) -> str:
@@ -206,11 +300,14 @@ def generate(state: AgentState, deps: AgentDeps) -> dict[str, Any]:
                     ),
                 ),
             ]
+        images = _answer_images(evidence, deps)
+        d["images"] = len(images)
         response = deps.llm.generate(
             messages,
             system=render("generate", abstain_text=ABSTAIN_TEXT),
-            role="strong",
+            role="vision" if images else "strong",
             task="generate",
+            images=images or None,
         )
         answer = strip_invalid_markers(response.text.strip(), len(evidence))
         abstained = is_abstention(answer)
@@ -221,6 +318,22 @@ def generate(state: AgentState, deps: AgentDeps) -> dict[str, Any]:
         update["revisions"] = state.get("revisions", 0) + 1
         update["feedback"] = None
     return update
+
+
+def _answer_images(evidence: list[ScoredChunk], deps: AgentDeps) -> list[ImageInput]:
+    """Top figure/chart/frame images among the evidence, for vision-capable generators."""
+    mm = deps.settings.multimodal
+    if not mm.answer_with_images or deps.assets is None:
+        return []
+    images: list[ImageInput] = []
+    for e in evidence:
+        c = e.chunk
+        if c.asset and c.modality in ("image", "chart") and deps.assets.exists(c.asset):
+            data = deps.assets.read(c.asset)
+            images.append(ImageInput(data=data, mime=guess_mime(data)))
+            if len(images) >= mm.max_answer_images:
+                break
+    return images
 
 
 def verify(state: AgentState, deps: AgentDeps) -> dict[str, Any]:

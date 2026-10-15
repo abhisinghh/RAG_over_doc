@@ -20,11 +20,12 @@ def format_sources(evidence: Sequence[ScoredChunk], max_chars: int = 4000) -> st
         # No ">" or quotes inside attribute values, so the tag stays well-formed.
         section = " / ".join(c.heading_path).replace('"', "'").replace(">", " ")
         source = c.source.replace('"', "'")
-        attrs = f'id="{i}" file="{source}" pages="{c.page_label}"'
+        locator = c.locator.replace('"', "'")
+        attrs = f'id="{i}" file="{source}" location="{locator}" type="{c.modality}"'
         if section:
             attrs += f' section="{section}"'
-        if c.kind == "summary":
-            attrs += ' type="summary"'
+        if c.kind != "chunk":
+            attrs += f' role="{c.kind}"'
         blocks.append(f"<source {attrs}>\n{neutralise(c.text[:max_chars])}\n</source>")
     return "\n\n".join(blocks)
 
@@ -69,6 +70,9 @@ def build_citations(
                     source=c.source,
                     pages=c.pages,
                     snippet=snippet,
+                    modality=c.modality,
+                    locator=c.locator,
+                    asset=c.asset,
                 )
             )
     return sorted(citations, key=lambda x: x.marker)

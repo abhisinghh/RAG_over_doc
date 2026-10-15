@@ -6,6 +6,7 @@ Also handles .docx, .md and .txt.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import logging
 import re
@@ -15,7 +16,10 @@ from ragdoc.types import Block, ParsedDocument
 
 log = logging.getLogger(__name__)
 
-SUPPORTED_SUFFIXES = {".pdf", ".docx", ".md", ".markdown", ".txt"}
+DOCUMENT_SUFFIXES = {".pdf", ".docx", ".md", ".markdown", ".txt"}
+IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tif", ".tiff"}
+# Kept for backwards compatibility; the full set (audio, video, code) lives in ingestion.router.
+SUPPORTED_SUFFIXES = DOCUMENT_SUFFIXES | IMAGE_SUFFIXES
 
 
 def file_sha256(path: Path) -> str:
@@ -50,10 +54,37 @@ def docling_available() -> bool:
     return True
 
 
-def parse_pdf_docling(path: Path) -> tuple[list[Block], int | None]:
+def _docling_converter(images: bool) -> object:
     from docling.document_converter import DocumentConverter
 
-    result = DocumentConverter().convert(str(path))
+    if not images:
+        return DocumentConverter()
+    try:  # render picture regions (captures vector charts too)
+        from docling.datamodel.base_models import InputFormat
+        from docling.datamodel.pipeline_options import PdfPipelineOptions
+        from docling.document_converter import PdfFormatOption
+
+        options = PdfPipelineOptions()
+        options.generate_picture_images = True
+        options.images_scale = 2.0
+        return DocumentConverter(
+            format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=options)}
+        )
+    except Exception as exc:  # older docling: no picture rendering
+        log.info("Docling picture rendering unavailable (%s)", exc)
+        return DocumentConverter()
+
+
+def _pil_to_png(image: object) -> bytes:
+    import io
+
+    buffer = io.BytesIO()
+    image.save(buffer, format="PNG")  # type: ignore[attr-defined]
+    return buffer.getvalue()
+
+
+def parse_pdf_docling(path: Path, images: bool = True) -> tuple[list[Block], int | None]:
+    result = _docling_converter(images).convert(str(path))  # type: ignore[attr-defined]
     doc = result.document
     blocks: list[Block] = []
     headings: list[tuple[int, str]] = []  # (level, text) stack
@@ -62,6 +93,31 @@ def parse_pdf_docling(path: Path) -> tuple[list[Block], int | None]:
         label = str(getattr(item, "label", "")).lower()
         prov = getattr(item, "prov", None) or []
         page = getattr(prov[0], "page_no", None) if prov else None
+        heading_path = [h[1] for h in headings]
+
+        if "picture" in label or "chart" in label:
+            if not images:
+                continue
+            try:
+                pil = item.get_image(doc)
+            except Exception:
+                pil = None
+            if pil is None:
+                continue
+            caption = ""
+            with contextlib.suppress(Exception):
+                caption = _clean(item.caption_text(doc) or "")
+            blocks.append(
+                Block(
+                    text=caption,
+                    page=page,
+                    kind="figure",
+                    modality="image",
+                    heading_path=heading_path,
+                    meta={"_image": _pil_to_png(pil), "caption": caption},
+                )
+            )
+            continue
 
         if "table" in label and hasattr(item, "export_to_markdown"):
             try:
@@ -75,6 +131,7 @@ def parse_pdf_docling(path: Path) -> tuple[list[Block], int | None]:
             if "section_header" in label or label.endswith("title"):
                 level = int(getattr(item, "level", 1) or 1)
                 headings = [h for h in headings if h[0] < level] + [(level, text.strip())]
+                heading_path = [h[1] for h in headings]
                 kind = "heading"
             elif "list" in label:
                 kind = "list"
@@ -86,7 +143,15 @@ def parse_pdf_docling(path: Path) -> tuple[list[Block], int | None]:
         text = _clean(text)
         if not text:
             continue
-        blocks.append(Block(text=text, page=page, kind=kind, heading_path=[h[1] for h in headings]))
+        blocks.append(
+            Block(
+                text=text,
+                page=page,
+                kind=kind,
+                modality="table" if kind == "table" else "text",
+                heading_path=heading_path,
+            )
+        )
 
     num_pages = len(getattr(doc, "pages", {}) or {}) or None
     return blocks, num_pages
@@ -184,10 +249,50 @@ def parse_markdown(text: str) -> list[Block]:
 # --------------------------------------------------------------------------- entry point
 
 
-def parse_document(path: str | Path, parser: str = "auto") -> ParsedDocument:
+def parse_image_file(path: Path) -> ParsedDocument:
+    sha = file_sha256(path)
+    block = Block(
+        text="",
+        kind="figure",
+        modality="image",
+        meta={"_image": path.read_bytes(), "caption": path.stem.replace("_", " ")},
+    )
+    return ParsedDocument(
+        doc_id=_doc_id(path, sha),
+        source=path.name,
+        title=path.stem,
+        blocks=[block],
+        sha256=sha,
+        kind="image",
+    )
+
+
+def _interleave_figures(blocks: list[Block], figures: list[Block]) -> list[Block]:
+    """Place each figure after the last text block of its page (keeps reading order)."""
+    out: list[Block] = []
+    pending = sorted(figures, key=lambda b: b.page or 0)
+    for i, block in enumerate(blocks):
+        out.append(block)
+        next_page = blocks[i + 1].page if i + 1 < len(blocks) else None
+        while (
+            pending
+            and block.page is not None
+            and pending[0].page == block.page
+            and next_page != block.page
+        ):
+            fig = pending.pop(0)
+            out.append(fig.model_copy(update={"heading_path": block.heading_path}))
+    return out + pending
+
+
+def parse_document(
+    path: str | Path, parser: str = "auto", images: bool = False, max_images: int = 200
+) -> ParsedDocument:
     path = Path(path)
     suffix = path.suffix.lower()
-    if suffix not in SUPPORTED_SUFFIXES:
+    if suffix in IMAGE_SUFFIXES:
+        return parse_image_file(path)
+    if suffix not in DOCUMENT_SUFFIXES:
         raise ValueError(
             f"Unsupported file type {suffix!r}; supported: {sorted(SUPPORTED_SUFFIXES)}"
         )
@@ -196,20 +301,26 @@ def parse_document(path: str | Path, parser: str = "auto") -> ParsedDocument:
 
     if suffix == ".pdf":
         use_docling = parser == "docling" or (parser == "auto" and docling_available())
+        blocks = []
         if use_docling:
             try:
-                blocks, num_pages = parse_pdf_docling(path)
+                blocks, num_pages = parse_pdf_docling(path, images=images)
             except Exception as exc:  # docling failures should not block ingestion
                 if parser == "docling":
                     raise
                 log.warning("Docling failed on %s (%s); falling back to pypdf", path.name, exc)
-                blocks, num_pages = parse_pdf_pypdf(path)
-        else:
+        if not blocks:
             blocks, num_pages = parse_pdf_pypdf(path)
+            if images:
+                from ragdoc.ingestion.figures import extract_pdf_images_pypdf
+
+                blocks = _interleave_figures(blocks, extract_pdf_images_pypdf(path, max_images))
     elif suffix == ".docx":
         blocks = parse_docx(path)
-    else:
+    elif suffix in {".md", ".markdown", ".txt"}:
         blocks = parse_markdown(path.read_text(encoding="utf-8", errors="replace"))
+    else:  # unreachable while DOCUMENT_SUFFIXES and the branches above agree
+        raise ValueError(f"No parser for {suffix!r}")
 
     if not blocks:
         raise ValueError(
@@ -217,6 +328,13 @@ def parse_document(path: str | Path, parser: str = "auto") -> ParsedDocument:
         )
 
     title = next((b.text for b in blocks if b.kind == "heading"), path.stem)
+    # Tables from non-docling parsers are plain blocks; tag them for the table pipeline.
+    blocks = [
+        b.model_copy(update={"modality": "table"})
+        if b.kind == "table" and b.modality == "text"
+        else b
+        for b in blocks
+    ]
     return ParsedDocument(
         doc_id=_doc_id(path, sha),
         source=path.name,

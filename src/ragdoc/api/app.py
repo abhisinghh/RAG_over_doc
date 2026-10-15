@@ -8,6 +8,10 @@ Endpoints
   POST   /search                 hybrid search + rerank (no generation)
   POST   /ask                    cited answer (JSON)
   POST   /ask/stream             agent steps + final answer as Server-Sent Events
+  GET    /assets/{path}          figure / keyframe image behind a citation
+  GET    /graph/stats            knowledge-graph counts
+  POST   /graph/build            (re)build communities and reports
+  GET    /services/{name}        dependency facts for one microservice
 """
 
 from __future__ import annotations
@@ -21,12 +25,16 @@ from pathlib import Path
 from typing import Annotated, Any
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
-from fastapi.responses import StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from ragdoc import __version__
+from ragdoc.code.parser import EXTENSIONS
 from ragdoc.engine import RagEngine
+from ragdoc.ingestion.media import AUDIO_SUFFIXES, VIDEO_SUFFIXES
 from ragdoc.ingestion.parsers import SUPPORTED_SUFFIXES
+
+UPLOAD_SUFFIXES = SUPPORTED_SUFFIXES | AUDIO_SUFFIXES | VIDEO_SUFFIXES | set(EXTENSIONS)
 
 
 class AskRequest(BaseModel):
@@ -59,8 +67,8 @@ def create_app(engine: RagEngine | None = None) -> FastAPI:
         }
 
     @app.get("/documents")
-    def documents() -> list[dict[str, Any]]:
-        return engine.list_documents()
+    def documents(limit: int = 100, offset: int = 0) -> list[dict[str, Any]]:
+        return engine.list_documents(limit=min(limit, 1000), offset=offset)
 
     @app.post("/documents", status_code=201)
     def upload(file: Annotated[UploadFile, File()], force: bool = False) -> dict[str, Any]:
@@ -78,7 +86,7 @@ def create_app(engine: RagEngine | None = None) -> FastAPI:
                     report = engine.ingest(target, force=force)
             except ValueError as exc:
                 raise HTTPException(422, str(exc)) from exc
-        return report.__dict__
+        return dict(report.__dict__)
 
     @app.delete("/documents/{doc_id}", status_code=204)
     def delete(doc_id: str) -> None:
@@ -118,6 +126,35 @@ def create_app(engine: RagEngine | None = None) -> FastAPI:
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
+
+    @app.get("/assets/{path:path}")
+    def asset(path: str) -> FileResponse:
+        try:
+            file = engine.assets.path(path)
+        except ValueError as exc:
+            raise HTTPException(400, "Invalid asset path") from exc
+        if not file.exists():
+            raise HTTPException(404, "Asset not found")
+        return FileResponse(file)
+
+    @app.get("/graph/stats")
+    def graph_stats() -> dict[str, Any]:
+        return engine.graph.stats()
+
+    @app.post("/graph/build")
+    def graph_build() -> dict[str, Any]:
+        with ingest_lock:
+            return engine.build_graph_index()
+
+    @app.get("/services/{name}")
+    def service(name: str) -> dict[str, Any]:
+        facts = engine.graph_retriever.services(name)
+        if not facts:
+            raise HTTPException(404, "No such service")
+        return {
+            "facts": facts[0].chunk.text,
+            "sources": [f.chunk.chunk_id for f in facts[1:]],
+        }
 
     return app
 

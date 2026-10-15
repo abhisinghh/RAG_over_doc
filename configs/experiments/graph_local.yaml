@@ -1,0 +1,7 @@
+# GraphRAG local search (entity neighbourhoods) for relational questions; no PageRank.
+graph:
+  enabled: true
+  ppr:
+    enabled: false
+agent:
+  enabled: true
