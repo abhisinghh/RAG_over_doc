@@ -7,6 +7,7 @@ rules, so the whole pipeline, including the LangGraph loop, runs without network
 from __future__ import annotations
 
 import hashlib
+import itertools
 import json
 import re
 from collections.abc import Sequence
@@ -53,6 +54,7 @@ def _overlap(a: str, b: str) -> int:
 class ScriptedLLM:
     def __init__(self) -> None:
         self.calls: list[str] = []
+        self.image_calls: list[tuple[str, int, str]] = []  # (task, n images, role)
 
     def generate(
         self,
@@ -63,8 +65,11 @@ class ScriptedLLM:
         task: str = "generate",
         json_mode: bool = False,
         cache_system: bool = False,
+        images: Sequence[object] | None = None,
     ) -> LLMResponse:
         self.calls.append(task)
+        if images:
+            self.image_calls.append((task, len(images), role))
         user = messages[0].content
         text = getattr(self, f"_{task}", self._default)(user, messages)
         return LLMResponse(text=text, model="scripted", input_tokens=10, output_tokens=5)
@@ -83,6 +88,14 @@ class ScriptedLLM:
         q = user.lower()
         if "joke" in q:
             route = "out_of_scope"
+        elif "total" in q or "sum of" in q:
+            route = "structured"
+        elif "service" in q or "function" in q:
+            route = "code"
+        elif "overall" in q or "themes" in q:
+            route = "global"
+        elif "relate" in q or "connected" in q:
+            route = "relational"
         elif " and " in q or "compare" in q:
             route = "multi_hop"
         else:
@@ -128,6 +141,71 @@ class ScriptedLLM:
         answer = re.search(r"<answer>\n(.*?)\n</answer>", user, re.DOTALL)
         claim = answer.group(1) if answer else ""
         return json.dumps({"claims": [{"claim": claim, "supported": True, "sources": [1]}]})
+
+    def _describe_figure(self, user: str, messages: Sequence[Message]) -> str:
+        return json.dumps(
+            {
+                "kind": "chart",
+                "title": "Quarterly revenue",
+                "description": "Bar chart of revenue by quarter; revenue rises every quarter.",
+                "text_in_image": "Revenue Q1 Q2",
+                "data_table": "| Quarter | Revenue (EUR m) |\n|---|---|\n| Q1 | 10 |\n| Q2 | 14 |",
+                "informative": True,
+            }
+        )
+
+    def _text_to_sql(self, user: str, messages: Sequence[Message]) -> str:
+        ids = re.findall(r'"t_([0-9a-f]{12})"', user)
+        if not ids:
+            return json.dumps({"answerable": False})
+        return json.dumps(
+            {"answerable": True, "sql": f'SELECT * FROM "t_{ids[0]}"', "table_ids": [ids[0]]}
+        )
+
+    _ENTITIES = ("Acme", "VPN", "IT", "Wi-Fi", "Central European Time")
+
+    def _extract_graph(self, user: str, messages: Sequence[Message]) -> str:
+        found = [e for e in self._ENTITIES if re.search(rf"\b{re.escape(e)}\b", user)]
+        entities = [
+            {
+                "name": e,
+                "type": "organization" if e == "Acme" else "technology",
+                "description": f"{e} in the handbook",
+            }
+            for e in found
+        ]
+        relations = [
+            {
+                "source": a,
+                "target": b,
+                "relation": "related_to",
+                "description": f"{a} and {b}",
+                "strength": 5,
+            }
+            for a, b in itertools.pairwise(found)
+        ]
+        return json.dumps({"entities": entities, "relations": relations})
+
+    def _recognize_facts(self, user: str, messages: Sequence[Message]) -> str:
+        question = self._question(user)
+        facts = re.findall(r"^(\d+)\. (.*)$", user, re.MULTILINE)
+        return json.dumps({"ids": [int(i) for i, text in facts if _overlap(question, text) >= 1]})
+
+    def _community_report(self, user: str, messages: Sequence[Message]) -> str:
+        return json.dumps(
+            {
+                "title": "Remote work infrastructure",
+                "summary": "Acme secures remote work with the VPN and IT equipment.",
+                "findings": ["The VPN is mandatory for remote work."],
+                "rating": 7,
+            }
+        )
+
+    def _doc_summary(self, user: str, messages: Sequence[Message]) -> str:
+        return "A summary of the document."
+
+    def _service_summary(self, user: str, messages: Sequence[Message]) -> str:
+        return "Owns its domain."
 
     def _judge_correctness(self, user: str, messages: Sequence[Message]) -> str:
         return json.dumps({"score": 1.0, "reason": "scripted"})

@@ -26,6 +26,7 @@ class LLMConfig(BaseModel):
     base_url: str | None = None
     fast_model: str = "gpt-5-mini"
     strong_model: str = "gpt-5"
+    vision_model: str | None = None  # None = strong_model (must accept image input)
     temperature: float | None = None
     max_output_tokens: int = 2048
     request_timeout_s: float = 60
@@ -50,6 +51,115 @@ class IngestionConfig(BaseModel):
     raptor: bool = False
     raptor_group_size: int = 6
     redact_pii: bool = False
+    doc_summary: bool = False  # one summary vector per document (needed for doc routing)
+    workers: int = 8  # parallel LLM calls per document / documents per batch
+
+
+class MultimodalConfig(BaseModel):
+    describe_images: bool = True  # VLM description + OCR for every figure / keyframe
+    chart_to_table: bool = True  # charts → approximate data table (queryable via SQL)
+    min_image_px: int = 120  # skip icons, logos and rules smaller than this
+    max_images_per_doc: int = 200
+    image_embeddings: bool = False  # CLIP vectors for text→image search (ragdoc[local])
+    image_embedding_model: str = "clip-ViT-B-32"
+    answer_with_images: bool = True  # attach top figures to the generator (vision models)
+    max_answer_images: int = 3
+
+
+class TableConfig(BaseModel):
+    merge_multipage: bool = True
+    rows_per_chunk: int = 40
+    sql: bool = True  # load tables into SQLite for text-to-SQL questions
+    max_sql_rows: int = 200
+
+
+class MediaConfig(BaseModel):
+    transcriber: Literal["openai", "local"] = "openai"
+    transcription_model: str = "whisper-1"
+    local_whisper_model: str = "small"
+    language: str | None = None
+    window_seconds: int = 90  # transcript chunk length
+    keyframe_interval_s: int = 30
+    keyframe_scene_threshold: float | None = None  # e.g. 0.3 = scene-change detection
+    max_keyframes: int = 120
+
+
+class CodeConfig(BaseModel):
+    max_file_bytes: int = 1_000_000
+    symbol_max_lines: int = 150  # longer symbols are split into overlapping windows
+    window_overlap_lines: int = 15
+    exclude_dirs: list[str] = Field(
+        default_factory=lambda: [
+            ".git",
+            "node_modules",
+            "vendor",
+            "dist",
+            "build",
+            "target",
+            "__pycache__",
+            ".venv",
+            "venv",
+            ".mypy_cache",
+            ".pytest_cache",
+            ".next",
+            "coverage",
+        ]
+    )
+    services: bool = True  # detect microservices and build the service graph
+    summarize_services: bool = True
+
+
+class PPRConfig(BaseModel):
+    """HippoRAG 2 retrieval: Personalized PageRank over phrases, facts and passages.
+
+    Defaults follow the authors' reference implementation (OSU-NLP-Group/HippoRAG).
+    """
+
+    # Query-time switch: use PPR for relational and multi-hop questions. The phrase and fact
+    # indexes are always built when graph extraction is on, so this can be toggled freely.
+    enabled: bool = True
+    linking_top_k: int = Field(
+        default=5, ge=1, description="Facts retrieved per query, and phrase seeds kept"
+    )
+    recognition_memory: bool = True  # LLM filter that keeps only relevant facts
+    passage_node_weight: float = Field(
+        default=0.05, ge=0, description="Passage seed weight relative to phrases"
+    )
+    passage_seed_k: int = Field(
+        default=200, ge=1, description="Passages seeded by dense similarity"
+    )
+    damping: float = Field(default=0.5, gt=0, lt=1, description="Probability of following an edge")
+    synonym_threshold: float = Field(default=0.8, ge=-1, le=1)
+    synonym_top_k: int = Field(default=100, ge=1, description="Max synonym edges per phrase")
+    max_iterations: int = 100
+    tolerance: float = 1e-8
+
+
+class GraphConfig(BaseModel):
+    enabled: bool = False  # entity/relation extraction costs one LLM call per chunk
+    store: Literal["sqlite", "neo4j"] = "sqlite"
+    neo4j_uri: str | None = None
+    neo4j_user: str = "neo4j"
+    entity_types: list[str] = Field(
+        default_factory=lambda: [
+            "person",
+            "organization",
+            "location",
+            "product",
+            "technology",
+            "concept",
+            "event",
+            "metric",
+            "document",
+        ]
+    )
+    local_top_entities: int = 10
+    max_hops: int = 1
+    max_relations: int = 40
+    community_max_size: int = 40
+    community_min_size: int = 3
+    global_top_communities: int = 12
+    ppr: PPRConfig = Field(default_factory=PPRConfig)
 
 
 class RetrievalConfig(BaseModel):
@@ -64,10 +174,27 @@ class RetrievalConfig(BaseModel):
     cross_encoder_model: str = "BAAI/bge-reranker-v2-m3"
     cohere_model: str = "rerank-v3.5"
     final_k: int = 8
+    # Scale: "memory" keeps BM25 in-process (fine to ~100k chunks); "qdrant_sparse" stores
+    # BM25 sparse vectors in Qdrant and fuses server-side (millions of chunks).
+    lexical: Literal["memory", "qdrant_sparse"] = "memory"
+    quantization: Literal["none", "int8"] = "none"
+    on_disk: bool = False
+    doc_routing: bool = False  # search document summaries first, then chunks of top docs
+    doc_routing_top_docs: int = 50
 
 
 class AgentConfig(BaseModel):
     enabled: bool = True
+    routes: list[str] = Field(
+        default_factory=lambda: [
+            "simple",
+            "multi_hop",
+            "global",
+            "relational",
+            "structured",
+            "code",
+        ]
+    )
     max_rewrites: int = 2
     max_sub_questions: int = 4
     min_relevant_chunks: int = 1
@@ -97,6 +224,11 @@ class Settings(BaseModel):
     agent: AgentConfig = Field(default_factory=AgentConfig)
     cache: CacheConfig = Field(default_factory=CacheConfig)
     tracing: TracingConfig = Field(default_factory=TracingConfig)
+    multimodal: MultimodalConfig = Field(default_factory=MultimodalConfig)
+    tables: TableConfig = Field(default_factory=TableConfig)
+    media: MediaConfig = Field(default_factory=MediaConfig)
+    code: CodeConfig = Field(default_factory=CodeConfig)
+    graph: GraphConfig = Field(default_factory=GraphConfig)
 
     @property
     def collection_dir(self) -> Path:
@@ -118,6 +250,7 @@ class Secrets(BaseSettings):
     cohere_api_key: SecretStr | None = None
     # Key for an OpenAI-compatible server (Ollama ignores it; vLLM/LM Studio may need it).
     llm_api_key: SecretStr | None = None
+    neo4j_password: SecretStr | None = None
 
     def get(self, name: str) -> str | None:
         value = getattr(self, name, None)

@@ -1,11 +1,13 @@
-"""Structure-aware, token-sized chunking.
+"""Structure- and modality-aware chunking.
 
 Rules:
-* chunks never cross a section boundary unless the running chunk is tiny;
-* tables stay whole (oversized tables are split by rows, header repeated);
+* prose chunks never cross a section boundary unless the running chunk is tiny;
+* tables are their own chunks, split by row groups with the header repeated;
+* figures, charts and video keyframes are their own chunks (one per image);
+* code arrives pre-split by symbol and is kept as-is;
+* audio/video transcripts are grouped into time windows (citations show timestamps);
 * oversized paragraphs are split on sentence boundaries;
-* consecutive chunks inside one section share a small sentence-level overlap;
-* every chunk keeps its page numbers and heading path for citations and filtering.
+* consecutive prose chunks inside one section share a small sentence-level overlap.
 """
 
 from __future__ import annotations
@@ -60,7 +62,7 @@ def _split_oversized_text(text: str, max_tokens: int) -> list[str]:
     return pieces
 
 
-def _split_table(text: str, max_tokens: int) -> list[str]:
+def _split_table(text: str, max_tokens: int, max_rows: int = 10_000) -> list[str]:
     lines = text.splitlines()
     if len(lines) < 3:
         return _split_oversized_text(text, max_tokens)
@@ -69,7 +71,7 @@ def _split_table(text: str, max_tokens: int) -> list[str]:
     current: list[str] = []
     for row in rows:
         candidate = "\n".join(header + current + [row])
-        if current and count_tokens(candidate) > max_tokens:
+        if current and (len(current) >= max_rows or count_tokens(candidate) > max_tokens):
             pieces.append("\n".join(header + current))
             current = []
         current.append(row)
@@ -92,18 +94,154 @@ def _tail_overlap(text: str, overlap_tokens: int) -> str:
     return " ".join(tail)
 
 
-def _expand_blocks(blocks: list[Block], max_tokens: int) -> list[Block]:
-    """Split any block larger than ``max_tokens`` into several blocks."""
+ATOMIC_MODALITIES = {"image", "chart", "table", "code", "service"}
+
+
+def _expand_blocks(blocks: list[Block], max_tokens: int, max_rows: int = 40) -> list[Block]:
+    """Split any block larger than ``max_tokens`` (or a table longer than ``max_rows``)."""
     out: list[Block] = []
     for block in blocks:
-        if count_tokens(block.text) <= max_tokens:
-            out.append(block)
-            continue
-        splitter = _split_table if block.kind == "table" else _split_oversized_text
-        out.extend(
-            block.model_copy(update={"text": part}) for part in splitter(block.text, max_tokens)
-        )
+        if block.kind == "table" or block.modality == "table":
+            parts = _split_table(block.text, max_tokens, max_rows)
+        elif block.modality in ("code", "image", "chart", "service"):
+            parts = [block.text]  # already sized by their parsers
+        elif count_tokens(block.text) <= max_tokens:
+            parts = [block.text]
+        else:
+            parts = _split_oversized_text(block.text, max_tokens)
+        out.extend(block.model_copy(update={"text": p}) for p in parts)
     return out
+
+
+def _prose_groups(
+    blocks: list[Block], chunk_tokens: int, overlap_tokens: int, min_chunk_tokens: int
+) -> list[list[Block]]:
+    groups: list[list[Block]] = []
+    current: list[Block] = []
+    current_tokens = 0
+    current_section: tuple[str, ...] | None = None
+
+    def flush() -> None:
+        nonlocal current, current_tokens
+        if current:
+            groups.append(current)
+        current, current_tokens = [], 0
+
+    for block in blocks:
+        if block.modality in ATOMIC_MODALITIES or block.kind in ("figure", "symbol"):
+            flush()
+            groups.append([block])
+            current_section = None
+            continue
+        section = tuple(block.heading_path[:2])  # top two heading levels define a section
+        n = count_tokens(block.text)
+        section_changed = current_section is not None and section != current_section
+        too_big = current_tokens + n > chunk_tokens
+
+        if current and ((section_changed and current_tokens >= min_chunk_tokens) or too_big):
+            previous = current
+            prev_text = "\n\n".join(b.text for b in previous)
+            overlap = "" if section_changed else _tail_overlap(prev_text, overlap_tokens)
+            flush()
+            if overlap and count_tokens(overlap) + n <= chunk_tokens:
+                # Overlap inherits the previous block's page so citations stay accurate.
+                current.append(
+                    Block(text=overlap, page=previous[-1].page, heading_path=block.heading_path)
+                )
+                current_tokens = count_tokens(overlap)
+        current.append(block)
+        current_tokens += n
+        current_section = section
+    flush()
+
+    # Merge a tiny trailing prose group into its (prose) predecessor.
+    if (
+        len(groups) > 1
+        and all(b.modality == "text" for b in groups[-1] + groups[-2])
+        and sum(count_tokens(b.text) for b in groups[-1]) < min_chunk_tokens
+    ):
+        last = groups.pop()
+        groups[-1] = groups[-1] + last
+    return groups
+
+
+def _time_groups(blocks: list[Block], window_s: float, chunk_tokens: int) -> list[list[Block]]:
+    """Group transcript segments into windows of ~window_s seconds; frames stay separate."""
+    groups: list[list[Block]] = []
+    current: list[Block] = []
+    tokens = 0
+    for block in sorted(blocks, key=lambda b: (b.start_s or 0.0, b.kind != "segment")):
+        if block.modality in ("image", "chart"):
+            groups.append([block])
+            continue
+        n = count_tokens(block.text)
+        start = (current[0].start_s or 0.0) if current else 0.0
+        if current and ((block.end_s or 0.0) - start > window_s or tokens + n > chunk_tokens):
+            groups.append(current)
+            current, tokens = [], 0
+        current.append(block)
+        tokens += n
+    if current:
+        groups.append(current)
+    return groups
+
+
+def _chunk_from_group(doc: ParsedDocument, group: list[Block], position: int) -> Chunk:
+    text = "\n\n".join(b.text for b in group).strip()
+    pages = sorted(
+        {p for b in group for p in (b.meta.get("pages") or ([b.page] if b.page else []))}
+    )
+    heading_path = next((b.heading_path for b in reversed(group) if b.heading_path), [])
+    first = group[0]
+    single = len(group) == 1
+    if single:
+        modality = first.modality
+    elif doc.kind in ("audio", "video"):
+        modality = doc.kind
+    else:
+        modality = "table" if any(b.modality == "table" for b in group) else "text"
+    starts = [b.start_s for b in group if b.start_s is not None]
+    ends = [b.end_s for b in group if b.end_s is not None]
+    table_ids = [b.meta["table_id"] for b in group if b.meta.get("table_id")]
+    metadata: dict[str, object] = {
+        "tokens": count_tokens(text),
+        "has_table": any(b.modality == "table" for b in group),
+    }
+    if table_ids:
+        metadata["table_ids"] = table_ids
+    if single:
+        for key in (
+            "symbol",
+            "language",
+            "service",
+            "figure_kind",
+            "title",
+            "caption",
+            "path",
+            "kind",
+            "calls",
+            "docstring",
+            "outline",
+            "endpoints",
+        ):
+            if first.meta.get(key):
+                metadata[key] = first.meta[key]
+    return Chunk(
+        chunk_id=f"{doc.doc_id}:{position:04d}",
+        doc_id=doc.doc_id,
+        source=doc.source,
+        text=text,
+        pages=pages,
+        heading_path=list(heading_path),
+        modality=modality,
+        position=position,
+        asset=first.asset if single else None,
+        start_s=min(starts) if starts else None,
+        end_s=max(ends) if ends else None,
+        line_start=first.line_start if single else None,
+        line_end=first.line_end if single else None,
+        metadata=metadata,
+    )
 
 
 def chunk_document(
@@ -111,62 +249,23 @@ def chunk_document(
     chunk_tokens: int = 600,
     overlap_tokens: int = 80,
     min_chunk_tokens: int = 40,
+    rows_per_chunk: int = 40,
+    window_seconds: float = 90,
 ) -> list[Chunk]:
-    blocks = _expand_blocks([b for b in doc.blocks if b.kind != "heading"], chunk_tokens)
-
-    groups: list[list[Block]] = []
-    current: list[Block] = []
-    current_tokens = 0
-    current_section: tuple[str, ...] | None = None
-
-    for block in blocks:
-        section = tuple(block.heading_path[:2])  # top two heading levels define a section
-        n = count_tokens(block.text)
-        section_changed = current_section is not None and section != current_section
-        too_big = current_tokens + n > chunk_tokens
-
-        if current and ((section_changed and current_tokens >= min_chunk_tokens) or too_big):
-            groups.append(current)
-            prev_text = "\n\n".join(b.text for b in current if b.kind != "table")
-            overlap = "" if section_changed else _tail_overlap(prev_text, overlap_tokens)
-            current, current_tokens = [], 0
-            if overlap and count_tokens(overlap) + n <= chunk_tokens:
-                # Overlap inherits the previous block's page so citations stay accurate.
-                current.append(
-                    Block(text=overlap, page=groups[-1][-1].page, heading_path=block.heading_path)
-                )
-                current_tokens = count_tokens(overlap)
-        current.append(block)
-        current_tokens += n
-        current_section = section
-    if current:
-        groups.append(current)
-
-    # Merge a tiny trailing group into its predecessor.
-    if len(groups) > 1 and sum(count_tokens(b.text) for b in groups[-1]) < min_chunk_tokens:
-        last = groups.pop()
-        groups[-1] = groups[-1] + last
-
-    chunks: list[Chunk] = []
-    for position, group in enumerate(groups):
-        text = "\n\n".join(b.text for b in group).strip()
-        if not text:
-            continue
-        pages = sorted({b.page for b in group if b.page is not None})
-        heading_path = next((b.heading_path for b in reversed(group) if b.heading_path), [])
-        chunks.append(
-            Chunk(
-                chunk_id=f"{doc.doc_id}:{position:04d}",
-                doc_id=doc.doc_id,
-                source=doc.source,
-                text=text,
-                pages=pages,
-                heading_path=list(heading_path),
-                position=position,
-                metadata={
-                    "tokens": count_tokens(text),
-                    "has_table": any(b.kind == "table" for b in group),
-                },
-            )
+    blocks = [b for b in doc.blocks if b.kind != "heading" and (b.text.strip() or b.asset)]
+    if doc.kind in ("audio", "video"):
+        groups = _time_groups(
+            _expand_blocks(blocks, chunk_tokens, rows_per_chunk), window_seconds, chunk_tokens
         )
-    return chunks
+    else:
+        groups = _prose_groups(
+            _expand_blocks(blocks, chunk_tokens, rows_per_chunk),
+            chunk_tokens,
+            overlap_tokens,
+            min_chunk_tokens,
+        )
+    chunks = [
+        _chunk_from_group(doc, group, position)
+        for position, group in enumerate(g for g in groups if g)
+    ]
+    return [c for c in chunks if c.text]

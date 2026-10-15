@@ -6,6 +6,7 @@ LM Studio, ...). Every call reports token usage to the active trace span.
 
 from __future__ import annotations
 
+import base64
 import json
 import re
 import time
@@ -17,13 +18,36 @@ from pydantic import BaseModel, ValidationError
 from ragdoc.config import LLMConfig, Secrets
 from ragdoc.observability.tracing import add_usage
 
-Role = Literal["fast", "strong"]
+Role = Literal["fast", "strong", "vision"]
 T = TypeVar("T", bound=BaseModel)
 
 
 class Message(BaseModel):
     role: Literal["user", "assistant"]
     content: str
+
+
+class ImageInput(BaseModel):
+    """An image sent to a vision-capable model (attached to the first user message)."""
+
+    data: bytes
+    mime: str = "image/png"
+
+    @property
+    def b64(self) -> str:
+        return base64.b64encode(self.data).decode()
+
+
+def guess_mime(data: bytes) -> str:
+    if data[:3] == b"\xff\xd8\xff":
+        return "image/jpeg"
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        return "image/png"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    if data[:6] in (b"GIF87a", b"GIF89a"):
+        return "image/gif"
+    return "image/png"
 
 
 class LLMResponse(BaseModel):
@@ -46,6 +70,7 @@ class LLM(Protocol):
         task: str = "generate",
         json_mode: bool = False,
         cache_system: bool = False,
+        images: Sequence[ImageInput] | None = None,
     ) -> LLMResponse: ...
 
 
@@ -88,6 +113,7 @@ def structured(
     role: Role = "fast",
     task: str = "structured",
     max_attempts: int = 2,
+    images: Sequence[ImageInput] | None = None,
 ) -> T:
     """Ask the model for JSON matching ``schema``; retries once with the validation error."""
     instructions = (
@@ -97,7 +123,14 @@ def structured(
     messages: list[Message] = [Message(role="user", content=user)]
     last_error: Exception | None = None
     for _ in range(max_attempts):
-        response = llm.generate(messages, system=instructions, role=role, task=task, json_mode=True)
+        response = llm.generate(
+            messages,
+            system=instructions,
+            role=role,
+            task=task,
+            json_mode=True,
+            images=images,
+        )
         try:
             return schema.model_validate(extract_json(response.text))
         except (StructuredOutputError, ValidationError) as exc:
@@ -114,6 +147,14 @@ def structured(
 
 
 # --------------------------------------------------------------------------- providers
+
+
+def _model_for(config: LLMConfig, role: Role) -> str:
+    if role == "fast":
+        return config.fast_model
+    if role == "vision":
+        return config.vision_model or config.strong_model
+    return config.strong_model
 
 
 class OpenAIChat:
@@ -142,12 +183,22 @@ class OpenAIChat:
         task: str = "generate",
         json_mode: bool = False,
         cache_system: bool = False,  # OpenAI caches long prompt prefixes automatically
+        images: Sequence[ImageInput] | None = None,
     ) -> LLMResponse:
-        model = self.config.fast_model if role == "fast" else self.config.strong_model
-        payload: list[dict[str, str]] = []
+        model = _model_for(self.config, role)
+        payload: list[dict[str, Any]] = []
         if system:
             payload.append({"role": "system", "content": system})
         payload.extend(m.model_dump() for m in messages)
+        if images:
+            last = next(m for m in payload if m["role"] == "user")  # images go with the question
+            last["content"] = [
+                {"type": "text", "text": last["content"]},
+                *(
+                    {"type": "image_url", "image_url": {"url": f"data:{im.mime};base64,{im.b64}"}}
+                    for im in images
+                ),
+            ]
 
         kwargs: dict[str, Any] = {"model": model, "messages": payload}
         if self.config.temperature is not None:
@@ -195,12 +246,26 @@ class AnthropicChat:
         task: str = "generate",
         json_mode: bool = False,
         cache_system: bool = False,
+        images: Sequence[ImageInput] | None = None,
     ) -> LLMResponse:
-        model = self.config.fast_model if role == "fast" else self.config.strong_model
+        model = _model_for(self.config, role)
+        payload: list[dict[str, Any]] = [m.model_dump() for m in messages]
+        if images:
+            last = next(m for m in payload if m["role"] == "user")  # images go with the question
+            last["content"] = [
+                *(
+                    {
+                        "type": "image",
+                        "source": {"type": "base64", "media_type": im.mime, "data": im.b64},
+                    }
+                    for im in images
+                ),
+                {"type": "text", "text": last["content"]},
+            ]
         kwargs: dict[str, Any] = {
             "model": model,
             "max_tokens": self.config.max_output_tokens,
-            "messages": [m.model_dump() for m in messages],
+            "messages": payload,
         }
         if system:
             block: dict[str, Any] = {"type": "text", "text": system}
