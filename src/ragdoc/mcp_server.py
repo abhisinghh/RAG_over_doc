@@ -25,14 +25,26 @@ def build_server(engine: RagEngine) -> Any:
 
     @server.tool()
     def search_document(
-        query: str, top_k: int = 8, doc_id: str | None = None
+        query: str, top_k: int = 8, doc_id: str | None = None, modality: str | None = None
     ) -> list[dict[str, Any]]:
         """Search the indexed documents (hybrid BM25 + vector search, reranked).
 
         Returns passages with source file, page numbers and section, so you can cite them.
-        Optionally restrict to one doc_id from list_documents.
+        Optionally restrict to one doc_id from list_documents, or to one modality:
+        text, table, image, chart, audio, video, code, service.
         """
-        return tools.search_document(engine, query, top_k=top_k, doc_id=doc_id)
+        return tools.search_document(engine, query, top_k=top_k, doc_id=doc_id, modality=modality)
+
+    @server.tool()
+    def service_dependencies(service: str) -> dict[str, Any]:
+        """Dependency facts for a microservice: what it calls, who calls it, topics it
+        publishes/consumes, datastores, and which services are transitively affected if it fails."""
+        return tools.service_dependencies(engine, service)
+
+    @server.tool()
+    def code_references(symbol: str) -> dict[str, Any]:
+        """Callers and callees of a function or class, with file paths and line ranges."""
+        return tools.code_references(engine, symbol)
 
     @server.tool()
     def read_pages(doc_id: str, pages: list[int]) -> list[dict[str, Any]]:
