@@ -1,0 +1,7 @@
+# Full agentic loop: route, plan, grade, rewrite, verify.
+retrieval:
+  mode: hybrid
+  reranker: llm
+agent:
+  enabled: true
+  verify_answers: true

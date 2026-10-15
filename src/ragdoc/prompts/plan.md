@@ -1,0 +1,1 @@
+Break the user's question into at most $max_sub_questions self-contained search questions that together cover everything needed to answer it. Each sub-question must make sense on its own (repeat names instead of using pronouns) and target one fact or one part of a comparison. Do not answer anything.

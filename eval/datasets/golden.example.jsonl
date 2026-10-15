@@ -1,0 +1,6 @@
+// Copy to golden.jsonl, put your PDFs in eval/datasets/docs/, and replace these examples.
+// Fields: id, question, reference_answer, gold_pages (1-based), doc (relative to this file), type, answerable.
+// Mix types: single, multi_hop, table, summary, unanswerable (aim for 10-15% unanswerable).
+{"id": "q1", "question": "What is the total revenue reported for fiscal year 2024?", "reference_answer": "Total revenue was $4.2 billion in FY2024.", "gold_pages": [12], "doc": "docs/annual-report.pdf", "type": "table", "answerable": true}
+{"id": "q2", "question": "How did operating margin change between 2023 and 2024, and what reasons does the report give?", "reference_answer": "Operating margin rose from 14% to 17%, attributed to lower logistics costs and price increases.", "gold_pages": [15, 22], "doc": "docs/annual-report.pdf", "type": "multi_hop", "answerable": true}
+{"id": "q3", "question": "Who is the company's chief risk officer?", "reference_answer": "Not in the document.", "gold_pages": [], "doc": "docs/annual-report.pdf", "type": "unanswerable", "answerable": false}

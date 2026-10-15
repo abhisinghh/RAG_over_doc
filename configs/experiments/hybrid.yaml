@@ -1,0 +1,6 @@
+# Hybrid BM25 + dense with reranking, single pass (no agent loop).
+retrieval:
+  mode: hybrid
+  reranker: llm
+agent:
+  enabled: false
