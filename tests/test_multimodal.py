@@ -91,6 +91,16 @@ def test_image_is_described_as_chart_and_queryable(tmp_path: Path, llm: Scripted
     )
 
 
+def test_image_files_are_parsed_as_images(tmp_path: Path) -> None:
+    """Regression: image files once fell through to the Markdown parser and were indexed as text."""
+    from ragdoc.ingestion.parsers import parse_document
+
+    doc = parse_document(_png(tmp_path / "diagram.png"))
+    assert doc.kind == "image"
+    assert len(doc.blocks) == 1 and doc.blocks[0].modality == "image"
+    assert doc.blocks[0].meta["_image"].startswith(b"\x89PNG")
+
+
 def test_tiny_images_are_skipped(tmp_path: Path) -> None:
     eng = RagEngine(make_settings(tmp_path), llm=ScriptedLLM(), embedder=HashEmbedder())
     with pytest.raises(ValueError):

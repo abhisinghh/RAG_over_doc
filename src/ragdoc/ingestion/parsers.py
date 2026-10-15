@@ -290,7 +290,9 @@ def parse_document(
 ) -> ParsedDocument:
     path = Path(path)
     suffix = path.suffix.lower()
-    if suffix not in SUPPORTED_SUFFIXES:
+    if suffix in IMAGE_SUFFIXES:
+        return parse_image_file(path)
+    if suffix not in DOCUMENT_SUFFIXES:
         raise ValueError(
             f"Unsupported file type {suffix!r}; supported: {sorted(SUPPORTED_SUFFIXES)}"
         )
@@ -315,8 +317,10 @@ def parse_document(
                 blocks = _interleave_figures(blocks, extract_pdf_images_pypdf(path, max_images))
     elif suffix == ".docx":
         blocks = parse_docx(path)
-    else:
+    elif suffix in {".md", ".markdown", ".txt"}:
         blocks = parse_markdown(path.read_text(encoding="utf-8", errors="replace"))
+    else:  # unreachable while DOCUMENT_SUFFIXES and the branches above agree
+        raise ValueError(f"No parser for {suffix!r}")
 
     if not blocks:
         raise ValueError(
