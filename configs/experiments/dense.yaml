@@ -1,0 +1,7 @@
+# Baseline close to the original repo: dense-only retrieval, no reranking, no agent.
+retrieval:
+  mode: dense
+  reranker: none
+  final_k: 5
+agent:
+  enabled: false
