@@ -64,10 +64,15 @@ question set, so you can compare configurations with numbers.
   keyframes described in context.
 - Optional CLIP image embeddings support text-to-image search.
 
-**Knowledge graph (GraphRAG)**
+**Knowledge graph (GraphRAG and HippoRAG 2)**
 - Entity and relationship extraction, with resolution of duplicate names.
+- HippoRAG 2 retrieval for relational and multi-hop questions. The question is matched to
+  stored facts, an LLM keeps only the relevant ones, and Personalized PageRank spreads
+  relevance from those facts and the closest passages through the graph. Passages are then
+  ranked by their PageRank score.
+- Synonym edges link entities with near-identical names, so facts connect across documents.
 - Hierarchical communities, each with an LLM-written report, used for corpus-wide questions.
-- Local search over entity neighbourhoods and global search over community reports.
+- Local search over entity neighbourhoods remains available as an alternative.
 - SQLite storage for local use; Neo4j for large graphs.
 
 **Code and microservices**
@@ -155,7 +160,8 @@ the route the agent took, the latency and the token usage. Add `--trace` to see 
 | `ragdoc ask "<question>" [--trace] [--json]` | Answer a question with citations |
 | `ragdoc batch questions.txt -f report.pdf` | Answer a file of questions and write `output.json` |
 | `ragdoc services [name]` | List microservices, or show one service's dependencies and impact |
-| `ragdoc graph build` | Build knowledge-graph communities to enable global questions |
+| `ragdoc graph build` | Index facts for HippoRAG 2 and build communities for global questions |
+| `ragdoc graph search "<query>" --mode ppr` | Inspect graph retrieval alone (`ppr`, `local` or `global`) |
 | `ragdoc docs`, `ragdoc delete <doc_id>` | List or remove indexed documents |
 | `ragdoc eval` | Run the evaluation harness |
 | `ragdoc serve`, `ragdoc ui`, `ragdoc mcp` | Start the REST API, Gradio UI or MCP server |
@@ -224,6 +230,8 @@ model) reads figures.
 | Run fully locally | `llm.provider: openai_compatible`, `llm.base_url`, `embeddings.provider: local` |
 | Reduce ingestion cost | `ingestion.contextualize: false`, `multimodal.describe_images: false` |
 | Enable GraphRAG | `graph.enabled: true`, then `ragdoc graph build` |
+| Use local graph search instead of HippoRAG 2 | `graph.ppr.enabled: false` |
+| Tune HippoRAG 2 | `graph.ppr.linking_top_k`, `passage_node_weight`, `damping`, `synonym_threshold` |
 | Large graphs | `graph.store: neo4j`, `graph.neo4j_uri` |
 | Text-to-image search | `multimodal.image_embeddings: true` (requires `local`) |
 | Local transcription | `media.transcriber: local` (requires `media`) |
@@ -240,6 +248,12 @@ comparison report.
 cp eval/datasets/golden.example.jsonl eval/datasets/golden.jsonl
 mkdir -p eval/datasets/docs && cp report.pdf eval/datasets/docs/
 python eval/run_eval.py      # compares dense, hybrid and agentic configurations
+```
+
+To compare graph strategies on multi-hop questions, pass the overlays explicitly:
+
+```bash
+ragdoc eval -e configs/experiments/hipporag.yaml -e configs/experiments/graph_local.yaml
 ```
 
 | Layer | Metrics |
@@ -277,7 +291,7 @@ src/ragdoc/
   code/            code parsing, repository ingestion, call graph, service discovery
   evaluation/      metrics, LLM judges, experiment runner
   generation/      source formatting and citation handling
-  graph/           graph stores, entity extraction, communities, graph search
+  graph/           graph stores, entity extraction, communities, HippoRAG 2 (PageRank), graph search
   guardrails/      prompt-injection screening, PII redaction
   ingestion/       parsers, figures, tables, media, chunking, pipeline, batch jobs
   models/          LLM, vision, embedding and transcription clients
@@ -320,6 +334,8 @@ a golden set with its documents are configured, it also runs a ten-question smok
 - Singh et al. [Agentic Retrieval-Augmented Generation: A Survey on Agentic RAG](https://arxiv.org/abs/2501.09136). 2025.
 - Anthropic. [Introducing Contextual Retrieval](https://www.anthropic.com/news/contextual-retrieval). 2024.
 - Edge et al. [From Local to Global: A Graph RAG Approach to Query-Focused Summarization](https://arxiv.org/abs/2404.16130). 2024.
+- Gutiérrez et al. [From RAG to Memory: Non-Parametric Continual Learning for Large Language Models (HippoRAG 2)](https://arxiv.org/abs/2502.14802). 2025. [Reference implementation](https://github.com/OSU-NLP-Group/HippoRAG).
+- Gutiérrez et al. [HippoRAG: Neurobiologically Inspired Long-Term Memory for Large Language Models](https://arxiv.org/abs/2405.14831). 2024.
 - Guo et al. [LightRAG: Simple and Fast Retrieval-Augmented Generation](https://arxiv.org/abs/2410.05779). 2024.
 - Jeong et al. [Adaptive-RAG](https://arxiv.org/abs/2403.14403). 2024.
 - Yan et al. [Corrective Retrieval Augmented Generation](https://arxiv.org/abs/2401.15884). 2024.

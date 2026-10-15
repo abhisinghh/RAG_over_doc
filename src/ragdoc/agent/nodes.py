@@ -1,9 +1,9 @@
 """Agent nodes. Each node takes the state and returns a partial state update.
 
-Techniques: Adaptive-RAG routing over retrieval strategies (hybrid, GraphRAG local/global,
-text-to-SQL over tables, code/service graphs), query decomposition, CRAG-style evidence
-grading with query rewriting + HyDE, cited (multimodal) generation, and
-Chain-of-Verification style claim checking.
+Techniques: Adaptive-RAG routing over retrieval strategies (hybrid search, HippoRAG 2
+Personalized PageRank, GraphRAG local/global search, text-to-SQL over tables, code and
+service graphs), query decomposition, CRAG-style evidence grading with query rewriting and
+HyDE, cited multimodal generation, and Chain-of-Verification style claim checking.
 """
 
 from __future__ import annotations
@@ -31,6 +31,7 @@ from ragdoc.retrieval.retriever import HybridRetriever
 from ragdoc.types import ScoredChunk
 
 if TYPE_CHECKING:
+    from ragdoc.graph.hipporag import HippoRetriever
     from ragdoc.graph.search import GraphRetriever
     from ragdoc.ingestion.assets import AssetStore
     from ragdoc.ingestion.tables import TableStore
@@ -55,6 +56,8 @@ class AgentDeps:
     recorder: TraceRecorder
     documents: list[str] = field(default_factory=list)  # titles, for the router prompt
     graph: GraphRetriever | None = None
+    ppr: HippoRetriever | None = None  # HippoRAG 2 Personalized PageRank retrieval
+    has_entities: bool = False  # the knowledge graph contains extracted entities
     tables: TableStore | None = None
     assets: AssetStore | None = None
     available_routes: list[str] = field(default_factory=lambda: ["simple", "multi_hop"])
@@ -133,8 +136,22 @@ def _strategy_evidence(
     try:
         if route_name == "global" and deps.graph is not None:
             out = deps.graph.global_(question)
+        elif (
+            route_name in ("relational", "multi_hop")
+            and deps.ppr is not None
+            and (
+                "relational" in deps.available_routes  # the graph has extracted entities
+            )
+        ):
+            # HippoRAG 2: PageRank from recognised facts; empty when no fact is relevant.
+            out = deps.ppr.search(question, doc_ids)
+            detail["graph_mode"] = "ppr"
+            if not out and route_name == "relational" and deps.graph is not None:
+                out = deps.graph.local(question, doc_ids)
+                detail["graph_mode"] = "local (no relevant facts)"
         elif route_name == "relational" and deps.graph is not None:
             out = deps.graph.local(question, doc_ids)
+            detail["graph_mode"] = "local"
         elif route_name == "code" and deps.graph is not None:
             out = deps.graph.code(question, doc_ids)
             if _SERVICE_HINT.search(question):

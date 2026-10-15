@@ -85,8 +85,10 @@ class GraphStore(Protocol):
     def edges_for(
         self, ids: Iterable[str], relations: Sequence[str] | None = None, limit: int = 200
     ) -> list[GEdge]: ...
+    def get_edges(self, keys: Iterable[str]) -> list[GEdge]: ...
     def all_nodes(self, types: Sequence[str] | None = None) -> list[Node]: ...
     def all_edges(self, types: Sequence[str] | None = None) -> list[GEdge]: ...
+    def revision(self) -> str: ...
     def set_communities(self, communities: Sequence[Community]) -> None: ...
     def communities(self, level: int | None = None) -> list[Community]: ...
     def delete_document(self, doc_id: str) -> None: ...
@@ -258,6 +260,29 @@ class SQLiteGraphStore:
         edges = [GEdge.model_validate_json(r[0]) for r in rows]
         return sorted(edges, key=lambda e: -e.weight)[:limit]
 
+    def get_edges(self, keys: Iterable[str]) -> list[GEdge]:
+        keys = list(dict.fromkeys(keys))
+        out: list[GEdge] = []
+        with self._lock:
+            for start in range(0, len(keys), 500):
+                part = keys[start : start + 500]
+                rows = self._db.execute(
+                    f"SELECT data FROM edges WHERE key IN ({','.join('?' * len(part))})", part
+                ).fetchall()
+                out += [GEdge.model_validate_json(r[0]) for r in rows]
+        return out
+
+    def revision(self) -> str:
+        """Changes whenever a node or edge is written or removed (INSERT OR REPLACE moves rowids)."""
+        with self._lock:
+            nodes = self._db.execute(
+                "SELECT COUNT(*), COALESCE(MAX(rowid), 0) FROM nodes"
+            ).fetchone()
+            edges = self._db.execute(
+                "SELECT COUNT(*), COALESCE(MAX(rowid), 0) FROM edges"
+            ).fetchone()
+        return f"{nodes[0]}.{nodes[1]}.{edges[0]}.{edges[1]}"
+
     def all_nodes(self, types: Sequence[str] | None = None) -> list[Node]:
         with self._lock:
             if types:
@@ -413,6 +438,24 @@ class Neo4jGraphStore:
                 GEdge.model_validate_json(r["data"])
                 for r in s.run(query, ids=list(ids), rels=list(relations or []), limit=limit)
             ]
+
+    def get_edges(self, keys: Iterable[str]) -> list[GEdge]:
+        with self._session() as s:
+            return [
+                GEdge.model_validate_json(r["data"])
+                for r in s.run(
+                    "MATCH ()-[e:REL]->() WHERE e.key IN $keys RETURN e.data AS data",
+                    keys=list(keys),
+                )
+            ]
+
+    def revision(self) -> str:
+        with self._session() as s:
+            row = s.run(
+                "MATCH (n:Node) WITH count(n) AS n "
+                "OPTIONAL MATCH ()-[e:REL]->() RETURN n, count(e) AS e, sum(e.weight) AS w"
+            ).single()
+        return f"{row['n']}.{row['e']}.{row['w']}"
 
     def all_nodes(self, types: Sequence[str] | None = None) -> list[Node]:
         query = (

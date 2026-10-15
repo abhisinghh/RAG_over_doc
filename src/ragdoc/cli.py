@@ -144,11 +144,35 @@ app.add_typer(graph_app, name="graph")
 
 @graph_app.command("build")
 def graph_build(ctx: typer.Context) -> None:
-    """Detect communities and write community reports (enables global questions)."""
+    """Index phrases and facts for HippoRAG 2, then detect communities and write their reports
+    (enables global questions)."""
     engine = _engine(ctx)
     with console.status("Building communities and reports..."):
         stats = engine.build_graph_index()
     console.print_json(json.dumps(stats, default=str))
+
+
+@graph_app.command("search")
+def graph_search(
+    ctx: typer.Context,
+    query: Annotated[str, typer.Argument()],
+    mode: Annotated[str, typer.Option(help="ppr (HippoRAG 2), local or global")] = "ppr",
+) -> None:
+    """Run graph retrieval alone and show the ranked evidence (useful for debugging)."""
+    results = _engine(ctx).graph_search(query, mode=mode)
+    if not results:
+        console.print("No graph evidence found (no relevant facts or entities).")
+        return
+    table = Table("#", "source", "location", "score", "text")
+    for i, r in enumerate(results, start=1):
+        table.add_row(
+            str(i),
+            r.chunk.source,
+            r.chunk.locator,
+            f"{r.score:.4f}",
+            r.chunk.text[:160].replace("\n", " "),
+        )
+    console.print(table)
 
 
 @graph_app.command("stats")

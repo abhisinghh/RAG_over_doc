@@ -1,0 +1,8 @@
+# HippoRAG 2: Personalized PageRank over phrases, facts and passages for relational and
+# multi-hop questions. Compare with graph_local.yaml and agentic.yaml on multi-hop questions.
+graph:
+  enabled: true
+  ppr:
+    enabled: true
+agent:
+  enabled: true

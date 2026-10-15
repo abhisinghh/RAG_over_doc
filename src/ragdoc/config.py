@@ -109,6 +109,32 @@ class CodeConfig(BaseModel):
     summarize_services: bool = True
 
 
+class PPRConfig(BaseModel):
+    """HippoRAG 2 retrieval: Personalized PageRank over phrases, facts and passages.
+
+    Defaults follow the authors' reference implementation (OSU-NLP-Group/HippoRAG).
+    """
+
+    # Query-time switch: use PPR for relational and multi-hop questions. The phrase and fact
+    # indexes are always built when graph extraction is on, so this can be toggled freely.
+    enabled: bool = True
+    linking_top_k: int = Field(
+        default=5, ge=1, description="Facts retrieved per query, and phrase seeds kept"
+    )
+    recognition_memory: bool = True  # LLM filter that keeps only relevant facts
+    passage_node_weight: float = Field(
+        default=0.05, ge=0, description="Passage seed weight relative to phrases"
+    )
+    passage_seed_k: int = Field(
+        default=200, ge=1, description="Passages seeded by dense similarity"
+    )
+    damping: float = Field(default=0.5, gt=0, lt=1, description="Probability of following an edge")
+    synonym_threshold: float = Field(default=0.8, ge=-1, le=1)
+    synonym_top_k: int = Field(default=100, ge=1, description="Max synonym edges per phrase")
+    max_iterations: int = 100
+    tolerance: float = 1e-8
+
+
 class GraphConfig(BaseModel):
     enabled: bool = False  # entity/relation extraction costs one LLM call per chunk
     store: Literal["sqlite", "neo4j"] = "sqlite"
@@ -133,6 +159,7 @@ class GraphConfig(BaseModel):
     community_max_size: int = 40
     community_min_size: int = 3
     global_top_communities: int = 12
+    ppr: PPRConfig = Field(default_factory=PPRConfig)
 
 
 class RetrievalConfig(BaseModel):

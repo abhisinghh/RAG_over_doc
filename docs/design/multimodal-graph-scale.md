@@ -108,9 +108,41 @@ consumers of its topics, and transitive dependants up to three hops.
 | Resolution | Names normalised (case, articles, punctuation); entities share one namespace across types; descriptions and sources merge on upsert |
 | Storage | SQLite (zero services) or Neo4j (`graph.store: neo4j`) behind one interface; every node/edge keeps the chunk ids it came from, so graph answers cite text |
 | Communities | Louvain on the entity graph; oversized communities split again (level 1); an LLM report per community, indexed as `community` chunks. For very large graphs run Leiden in Neo4j GDS and load the result |
-| Local search (`relational` route) | Entities matched by name and by vector → their relations (1-2 hops) → a facts chunk + the most-mentioned source chunks |
+| HippoRAG 2 (`relational` and `multi_hop` routes, default) | Facts recognised by the LLM seed Personalized PageRank over phrases and passages; see the next section |
+| Local search (`relational` route when `graph.ppr.enabled: false`) | Entities matched by name and by vector → their relations (1-2 hops) → a facts chunk + the most-mentioned source chunks |
 | Global search (`global` route) | Community reports ranked against the question |
 | Incremental | Extraction runs per document at ingest; `ragdoc graph build` recomputes communities when convenient |
+
+## HippoRAG 2 (Personalized PageRank)
+
+Graph neighbourhood search finds facts next to the entities named in a question, but
+multi-hop questions often hinge on an entity the question never names (the director of a
+film, the parent company of a supplier). HippoRAG 2 handles this by spreading relevance
+through the graph with Personalized PageRank instead of following a fixed number of hops.
+
+| Step | Implementation | Code |
+| --- | --- | --- |
+| Phrase index | Every extracted entity is embedded by its name | `graph/hipporag.py` · `HippoIndexer` |
+| Synonym edges | New phrases are linked to existing ones with name similarity ≥ `synonym_threshold` (0.8), at most `synonym_top_k` per phrase; names under three characters are skipped | `HippoIndexer._add_synonym_edges` |
+| Fact index | Every (subject, relation, object) fact is embedded as a sentence | `HippoIndexer.index` |
+| Graph | Phrase and passage nodes; fact edges weighted by how many chunks state the fact; synonym edges weighted by similarity; phrase–passage context edges with weight 1 | `graph/ppr.py` · `build_ppr_graph` |
+| Query-to-fact | The `linking_top_k` (5) facts closest to the question | `HippoRetriever._match_facts` |
+| Recognition memory | An LLM keeps only the facts that help answer; if none survive, the agent falls back to local graph search (relational) or ordinary retrieval (multi-hop) | `HippoRetriever._recognise` |
+| Seeds | Phrase weight = fact score ÷ number of passages containing the phrase, averaged over facts, top `linking_top_k` kept. Passage weight = min-max-normalised dense similarity × `passage_node_weight` (0.05) | `_phrase_seeds`, `_passage_seeds` |
+| PageRank | Weighted power iteration on the undirected graph, damping 0.5 | `graph/ppr.py` · `personalized_pagerank` |
+| Ranking | Passages by PageRank score; a facts chunk is added as pinned evidence | `_rank_passages` |
+
+Defaults come from the authors' reference implementation. Two deliberate differences keep
+query cost bounded at scale: only the `passage_seed_k` (200) most similar passages are
+seeded, where the reference seeds every passage, and fact scores are raw cosine similarities
+from the vector index rather than normalised over all facts.
+
+The phrase and fact indexes are built at ingestion whenever graph extraction is enabled, and
+`ragdoc graph build` backfills anything missing. `graph.ppr.enabled` only switches the
+query-time strategy, so `configs/experiments/hipporag.yaml` and `graph_local.yaml` can be
+compared on the same index. The PageRank graph is cached in memory and rebuilt when the
+knowledge graph's revision changes. For graphs with tens of millions of edges, running
+PageRank inside Neo4j Graph Data Science is the next step.
 
 ## Millions of documents
 

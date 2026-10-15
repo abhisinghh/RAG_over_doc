@@ -42,7 +42,7 @@ every answer carries per-step latency and token usage.
 | --- | --- | --- | --- |
 | route | fast | one of the routes the index can serve (simple, multi_hop, global, relational, structured, code) or out_of_scope | defaults to simple |
 | plan | fast | ≤ `max_sub_questions` sub-questions | falls back to the original question |
-| retrieve | — | route strategy (graph facts, community reports, SQL result, call/service graph) + hybrid top-k, merged | a failing strategy falls back to hybrid only |
+| retrieve | — | route strategy (HippoRAG 2 PageRank, community reports, SQL result, call/service graph) + hybrid top-k, merged | no relevant facts → local graph search; a failing strategy falls back to hybrid only |
 | grade | fast | 0-3 relevance per passage (graph facts and SQL results are pinned) | fails open (all relevant) |
 | rewrite | fast | new query + HyDE passage | reuses the question |
 | generate | strong / vision | answer with `[n]` citations; top figures attached for vision models | abstains if no evidence |

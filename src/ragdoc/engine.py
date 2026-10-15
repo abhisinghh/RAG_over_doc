@@ -123,6 +123,30 @@ class RagEngine:
             s.graph,
             s.retrieval.final_k,
         )
+        # HippoRAG 2 (Personalized PageRank) shares the graph store and adds two small indexes.
+        from ragdoc.graph.hipporag import HippoIndexer, HippoRetriever
+
+        phrase_vectors = store(f"{s.collection}__phrases")
+        fact_vectors = store(f"{s.collection}__facts")
+        self.ppr_indexer = HippoIndexer(
+            self.graph,
+            self.embedder,
+            phrase_vectors,
+            fact_vectors,
+            s.graph.ppr,
+            root / "ppr_index.sqlite",
+        )
+        self.ppr_retriever = HippoRetriever(
+            self.graph,
+            self.docs,
+            self.embedder,
+            self.llm,
+            phrase_vectors,
+            fact_vectors,
+            self.vectors,
+            s.graph.ppr,
+            s.retrieval.final_k,
+        )
         self.pipeline = IngestionPipeline(
             s,
             self.llm,
@@ -133,12 +157,13 @@ class RagEngine:
             tables=self.tables,
             graph=self.graph,
             graph_retriever=self.graph_retriever,
+            ppr_indexer=self.ppr_indexer,  # always indexed, so experiments can switch PPR on/off
             image_vectors=self.image_vectors,
             clip=self.clip,
             transcriber_factory=transcriber_factory,
         )
         self.cache = AnswerCache(root / "answers.sqlite") if s.cache.answers else None
-        self._caps: tuple[int, list[str]] | None = None
+        self._caps: tuple[int, list[str], bool] | None = None
         self._caps_lock = threading.Lock()
 
     def _make_graph_store(self, secrets: Secrets) -> Any:
@@ -220,6 +245,7 @@ class RagEngine:
             write_reports,
         )
 
+        ppr_stats = self.ppr_indexer.index()
         communities = detect_communities(self.graph, self.settings.graph)
         reports = write_reports(self.llm, self.graph, communities, self.settings.ingestion.workers)
         self.graph.set_communities(reports)
@@ -237,7 +263,7 @@ class RagEngine:
             config_fp="graph",
         )
         self._caps = None
-        return {"communities": len(reports), **self.graph.stats()}
+        return {"communities": len(reports), "hipporag": ppr_stats.__dict__, **self.graph.stats()}
 
     def list_documents(self, limit: int | None = None, offset: int = 0) -> list[dict[str, Any]]:
         return self.docs.list_documents(limit, offset)
@@ -261,23 +287,31 @@ class RagEngine:
     ) -> list[ScoredChunk]:
         return self.retriever.search(query, doc_ids=doc_ids, top_k=top_k, modalities=modalities)
 
+    def graph_search(
+        self, query: str, mode: str = "ppr", doc_ids: Sequence[str] | None = None
+    ) -> list[ScoredChunk]:
+        """Graph retrieval only, for inspection: ``ppr`` (HippoRAG 2), ``local`` or ``global``."""
+        if mode == "ppr":
+            return self.ppr_retriever.search(query, doc_ids)
+        if mode == "local":
+            return self.graph_retriever.local(query, doc_ids)
+        if mode == "global":
+            return self.graph_retriever.global_(query)
+        raise ValueError(f"Unknown graph search mode: {mode!r} (use ppr, local or global)")
+
     def read_pages(self, doc_id: str, pages: Sequence[int]) -> list[Chunk]:
         return self.docs.pages(doc_id, pages)
 
     # ------------------------------------------------------------------ answering
 
-    def available_routes(self) -> list[str]:
-        """Routes the router may pick, given what is actually indexed (cached per corpus version)."""
+    def _capabilities(self) -> tuple[list[str], bool]:
+        """Routes the index can serve, and whether the graph has entities (cached per corpus version)."""
         with self._caps_lock:
             if self._caps is not None and self._caps[0] == self.docs.version:
-                return self._caps[1]
-            configured = self.settings.agent.routes
+                return self._caps[1], self._caps[2]
             stats = self.graph.stats()
-            node_types = stats.get("nodes", {})
-            has_entities = any(
-                t not in {"file", "symbol", "module", "endpoint", "service", "topic", "datastore"}
-                for t in node_types
-            )
+            structural = {"file", "symbol", "module", "endpoint", "service", "topic", "datastore"}
+            has_entities = any(t not in structural for t in stats.get("nodes", {}))
             checks = {
                 "simple": True,
                 "multi_hop": True,
@@ -286,11 +320,16 @@ class RagEngine:
                 "structured": self.tables is not None and self.tables.count() > 0,
                 "code": self.docs.has_modality("code") or self.docs.has_modality("service"),
             }
-            routes = [r for r in configured if checks.get(r, False)]
-            self._caps = (self.docs.version, routes)
-            return routes
+            routes = [r for r in self.settings.agent.routes if checks.get(r, False)]
+            self._caps = (self.docs.version, routes, has_entities)
+            return routes, has_entities
+
+    def available_routes(self) -> list[str]:
+        """Routes the router may pick, given what is actually indexed."""
+        return self._capabilities()[0]
 
     def _deps(self, recorder: TraceRecorder) -> AgentDeps:
+        routes, has_entities = self._capabilities()
         titles = [d["title"] or d["source"] for d in self.docs.list_documents(limit=20)]
         return AgentDeps(
             settings=self.settings,
@@ -299,9 +338,11 @@ class RagEngine:
             recorder=recorder,
             documents=titles,
             graph=self.graph_retriever,
+            ppr=self.ppr_retriever if self.settings.graph.ppr.enabled else None,
             tables=self.tables,
             assets=self.assets,
-            available_routes=self.available_routes(),
+            available_routes=routes,
+            has_entities=has_entities,
         )
 
     def _cache_key(self, question: str, doc_ids: list[str] | None) -> str:

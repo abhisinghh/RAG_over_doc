@@ -14,9 +14,12 @@ from ragdoc.retrieval.store import InMemoryVectorStore, SearchFilter
 from ragdoc.types import Chunk
 
 
-def _graph_engine(tmp_path: Path) -> RagEngine:
+def _graph_engine(tmp_path: Path, ppr: bool = True) -> RagEngine:
     eng = RagEngine(
-        make_settings(tmp_path, graph={"enabled": True, "community_min_size": 2}),
+        make_settings(
+            tmp_path,
+            graph={"enabled": True, "community_min_size": 2, "ppr": {"enabled": ppr}},
+        ),
         llm=ScriptedLLM(),
         embedder=HashEmbedder(),
     )
@@ -70,7 +73,7 @@ def test_graph_store_merges_and_deletes(tmp_path: Path) -> None:
 
 
 def test_relational_question_uses_local_graph_search(tmp_path: Path) -> None:
-    eng = _graph_engine(tmp_path)
+    eng = _graph_engine(tmp_path, ppr=False)
     assert "relational" in eng.available_routes()
     result = eng.ask("How does Acme relate to the VPN?")
     assert result.route == "relational"

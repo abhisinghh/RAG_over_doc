@@ -186,6 +186,11 @@ class ScriptedLLM:
         ]
         return json.dumps({"entities": entities, "relations": relations})
 
+    def _recognize_facts(self, user: str, messages: Sequence[Message]) -> str:
+        question = self._question(user)
+        facts = re.findall(r"^(\d+)\. (.*)$", user, re.MULTILINE)
+        return json.dumps({"ids": [int(i) for i, text in facts if _overlap(question, text) >= 1]})
+
     def _community_report(self, user: str, messages: Sequence[Message]) -> str:
         return json.dumps(
             {

@@ -121,3 +121,16 @@ graph:
   community_max_size: 40
   community_min_size: 3
   global_top_communities: 12
+  # HippoRAG 2: Personalized PageRank over phrases, facts and passages. Used for relational and
+  # multi-hop questions once the graph has entities. Defaults follow the authors' implementation.
+  ppr:
+    enabled: true               # query-time switch; the indexes are built whenever graph.enabled
+    linking_top_k: 5            # facts matched per query; also the number of phrase seeds kept
+    recognition_memory: true    # LLM keeps only the relevant facts before seeding
+    passage_node_weight: 0.05   # passage seed weight relative to phrase seeds
+    passage_seed_k: 200         # passages seeded by dense similarity
+    damping: 0.5                # probability of following an edge rather than restarting
+    synonym_threshold: 0.8      # cosine similarity needed for a synonym edge between phrases
+    synonym_top_k: 100          # max synonym edges per phrase
+    max_iterations: 100
+    tolerance: 1.0e-8

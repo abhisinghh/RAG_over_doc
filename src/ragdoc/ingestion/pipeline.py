@@ -40,6 +40,7 @@ from ragdoc.retrieval.store import DocStore, VectorStore
 from ragdoc.types import Block, Chunk, ParsedDocument
 
 if TYPE_CHECKING:
+    from ragdoc.graph.hipporag import HippoIndexer
     from ragdoc.graph.search import GraphRetriever
     from ragdoc.graph.store import GraphStore
     from ragdoc.models.transcribe import Transcriber
@@ -79,6 +80,7 @@ class IngestionPipeline:
         tables: TableStore | None = None,
         graph: GraphStore | None = None,
         graph_retriever: GraphRetriever | None = None,
+        ppr_indexer: HippoIndexer | None = None,
         image_vectors: VectorStore | None = None,
         clip: Any = None,
         transcriber_factory: Callable[[], Transcriber] | None = None,
@@ -92,6 +94,7 @@ class IngestionPipeline:
         self.tables = tables
         self.graph = graph
         self.graph_retriever = graph_retriever
+        self.ppr_indexer = ppr_indexer
         self.image_vectors = image_vectors
         self.clip = clip
         self._transcriber_factory = transcriber_factory
@@ -372,9 +375,13 @@ class IngestionPipeline:
                     )
                     self.graph.upsert_nodes(nodes)
                     self.graph.upsert_edges(edges)
+                    node_ids = list(dict.fromkeys(n.id for n in nodes))
                     if self.graph_retriever is not None:
-                        self.graph_retriever.index_entities([n.id for n in nodes])
-                    entities = len({n.id for n in nodes})
+                        self.graph_retriever.index_entities(node_ids)
+                    if self.ppr_indexer is not None:
+                        stats = self.ppr_indexer.index(node_ids)
+                        d.update(synonym_edges=stats.synonym_edges, facts=stats.facts)
+                    entities = len(node_ids)
                     d.update(entities=entities, relations=len(edges))
 
         seconds = sum(e.latency_ms for e in recorder.events) / 1000
